@@ -31,27 +31,30 @@ CONFIG = {
     'LINHAS_OPACIDADE': 0.6,
     
     # Estilo das Cotas Automáticas (Medições)
-    'COTAS_MOSTRAR_TODAS': False, # Se True, mostra até as que estão OK (pode poluir)
-    'COTAS_MOSTRAR_ALERTAS': True, # Mostra as que estão fora da tolerância
+    'COTAS_MOSTRAR_TODAS': True,
+    'COTAS_MOSTRAR_ALERTAS': True, 
+    'LISTA_PASSOS_VISUALIZACAO': [10], # Gera mapas para cada passo: 1=Todas, 2=50%, 5=20%, etc.
     'COTA_COR_OK': '#00FF00', # Verde (dentro do padrão)
-    'COTA_COR_ALERTA': '#FF00FF', # Magenta (fora do padrão - ALERTA)
+    'COTA_COR_ALERTA': '#FF0000', # Vermelho (fora do padrão - ALERTA)
     'COTA_ESPESSURA': 2,
     
     # Parâmetros de Tolerância (O que é aceitável?)
-    'TOLERANCIA_MIN': 2.5, # Abaixo disso é alerta
-    'TOLERANCIA_MAX': 3.5, # Acima disso é alerta
+    'TOLERANCIA_MIN': 2.9, # Abaixo disso é alerta
+    'TOLERANCIA_MAX': 3.1, # Acima disso é alerta
+    'FATOR_CORTE_VISUALIZACAO': 2.0, # Multiplicador sobre a TOLERANCIA_MAX. Se dist > (MAX * 2), a cota é descartada (gap entre talhões).
     
     # Parâmetros de Geração de Linha
     'QUEBRA_TEMPO_SEC': 60,
     'QUEBRA_ANGULO_GRAUS': 60,
     
     # Parâmetros de Cálculo de Espaçamento
-    # NOTA: Agora o Python gera um SUPERSET (alta densidade).
-    # O filtro real de amostragem e offset será feito no JS.
-    'OFFSET_CABECEIRA_METROS': 10.0, # Python gera tudo, JS filtra
-    'AMOSTRAGEM_DIST_METROS': 1.0, # Alta densidade para o JS ter liberdade
-    'FILTRO_DIST_MIN': 0.1, 
-    'FILTRO_DIST_MAX': 100.0, 
+    # NOTA: O filtro de amostragem e offset é feito no Python.
+    'OFFSET_CABECEIRA_METROS': 10.0,
+    'AMOSTRAGEM_DIST_METROS': 5.0,
+    'MIN_DIST_ENTRE_COTAS_MESMA_LINHA': 3.0, # Distância mínima entre cotas na mesma linha (limpeza visual)
+    'FILTRO_DIST_MIN': 1.35, # Aumentado para ignorar sobreposições e segmentos colineares muito próximos
+    'FILTRO_DIST_MAX': 15.0, # Reduzido para evitar conectar com linhas muito distantes (ex: 24m)
+    'MIN_DIST_TOPOLOGICA': 50.0, # Distância mínima AO LONGO DA LINHA para considerar como vizinho (evita auto-interseção local)
 }
 
 def calcular_utm_epsg(lat, lon):
@@ -297,6 +300,9 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                 geom = row.geometry
                 length = geom.length
                 
+                # Variável para controle de densidade espacial na MESMA linha
+                ultimo_pos_valida = -9999.0
+                
                 # Cria pontos de amostragem a cada X metros (ALTA DENSIDADE para o Frontend filtrar)
                 # Exportamos metadados de posição para o JS poder aplicar o Offset dinamicamente
                 
@@ -309,6 +315,9 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                 
                 for i, pt in enumerate(pontos_amostra):
                     dist_from_start = distancias_amostragem[i]
+                    if CONFIG['OFFSET_CABECEIRA_METROS'] > 0:
+                        if dist_from_start < CONFIG['OFFSET_CABECEIRA_METROS'] or dist_from_start > (length - CONFIG['OFFSET_CABECEIRA_METROS']):
+                            continue
                     
                     # Busca linhas candidatas num raio de busca (ex: 50m)
                     candidatos_idx = list(sindex.intersection(pt.buffer(CONFIG['FILTRO_DIST_MAX']).bounds))
@@ -319,8 +328,8 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                     ponto_vizinho_mais_proximo = None
                     
                     for cand_idx, cand_row in candidatos.iterrows():
-                        if cand_idx == idx:
-                            continue # Pula a própria linha
+                        # Removido filtro de 'mesmo indice' para permitir vizinhos na mesma polilinha (curvas suaves)
+                        # if cand_idx == idx: continue 
                         
                         # Para achar o ponto exato na linha vizinha, usamos nearest_points da shapely ops
                         from shapely.ops import nearest_points
@@ -328,12 +337,70 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                         
                         dist = p1.distance(p2)
                         
+                        # Filtra distâncias muito pequenas (sobreposições ou mesmo segmento quebrado)
+                        if dist < CONFIG['FILTRO_DIST_MIN']:
+                            continue
+
+                        # Se for a MESMA linha, verifica a distância topológica (ao longo do caminho)
+                        # Se os pontos estiverem geometricamente perto (3m) mas topologicamente longe (100m), é uma passada paralela!
+                        if cand_idx == idx:
+                            # Projeta p2 na linha para saber a posição linear
+                            pos2 = cand_row.geometry.project(p2)
+                            dist_topologica = abs(pos2 - dist_from_start)
+                            
+                            if dist_topologica < CONFIG['MIN_DIST_TOPOLOGICA']:
+                                continue # É o mesmo segmento local, ignora
+
                         if dist < min_dist:
+                            # VALIDAÇÃO DE ÂNGULO: A cota deve ser perpendicular à linha original
+                            # Calculamos o vetor da linha (tangente) e o vetor da cota
+                            
+                            # Pega um ponto um pouco a frente na linha para vetor tangente
+                            delta = 1.0 # metros
+                            pt_frente = geom.interpolate(dist_from_start + delta)
+                            if dist_from_start + delta > length:
+                                pt_frente = geom.interpolate(dist_from_start - delta)
+                                vec_linha = (pt.x - pt_frente.x, pt.y - pt_frente.y)
+                            else:
+                                vec_linha = (pt_frente.x - pt.x, pt_frente.y - pt.y)
+                            
+                            # Vetor da cota
+                            vec_cota = (p2.x - pt.x, p2.y - pt.y)
+                            
+                            # Produto Escalar para achar o ângulo
+                            import math
+                            def get_angle(v1, v2):
+                                dot = v1[0]*v2[0] + v1[1]*v2[1]
+                                mag1 = math.sqrt(v1[0]**2 + v1[1]**2)
+                                mag2 = math.sqrt(v2[0]**2 + v2[1]**2)
+                                if mag1 * mag2 == 0: return 0
+                                cos_theta = dot / (mag1 * mag2)
+                                cos_theta = max(min(cos_theta, 1), -1) # Clamp
+                                return math.degrees(math.acos(cos_theta))
+                            
+                            angulo = get_angle(vec_linha, vec_cota)
+                            
+                            # Ângulo deve ser próximo de 90 graus (ex: entre 45 e 135)
+                            # Se for perto de 0 ou 180, é longitudinal (paralelo)
+                            if not (45 <= angulo <= 135):
+                                continue 
+
                             min_dist = dist
                             found_neighbor = True
                             ponto_vizinho_mais_proximo = p2
                     
                     if found_neighbor:
+                        # --- FILTRO 1: Descarte de distâncias muito grandes (gaps entre talhões) ---
+                        limite_descarte = CONFIG['TOLERANCIA_MAX'] * CONFIG['FATOR_CORTE_VISUALIZACAO']
+                        if min_dist > limite_descarte:
+                            continue
+
+                        # --- FILTRO 2: Limpeza visual de cotas muito próximas na mesma linha ---
+                        if (dist_from_start - ultimo_pos_valida) < CONFIG['MIN_DIST_ENTRE_COTAS_MESMA_LINHA']:
+                             continue
+                        
+                        ultimo_pos_valida = dist_from_start # Atualiza a posição da última cota válida
+
                         distancias.append(min_dist)
                         # Salva a geometria da cota (Linha entre P1 e P2)
                         cotas_geometry.append(LineString([pt, ponto_vizinho_mais_proximo]))
@@ -399,12 +466,11 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
             stats_html += "<p>Não foi possível calcular espaçamento entre linhas (possível passe único ou dados esparsos).</p>"
     
     # ---------------------------------------------------------
-    # 4. GERAÇÃO DO MAPA INTERATIVO (LEAFLET)
+    # 4. GERAÇÃO DOS MAPAS INTERATIVOS (LOOP POR DENSIDADE)
     # ---------------------------------------------------------
-    print("\n--- Gerando Mapa Interativo ---")
+    print("\n--- Gerando Mapas Interativos ---")
     
-    # Usa o GeoDataFrame original (WGS84) para o mapa, pois Leaflet usa Lat/Lon
-    # Mas vamos simplificar a geometria se for muito pesada
+    # Prepara dados para o mapa (WGS84)
     gdf_mapa = gdf.copy()
     
     # Se tiver muitos pontos (> 5000), faz uma amostragem para o mapa não travar
@@ -416,418 +482,169 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
     centro_lat = gdf_mapa.geometry.y.mean()
     centro_lon = gdf_mapa.geometry.x.mean()
     
-    # Cria o objeto Mapa
-    m = folium.Map(
-        location=[centro_lat, centro_lon], 
-        zoom_start=CONFIG['MAPA_ZOOM_INICIAL'], 
-        max_zoom=CONFIG['MAPA_MAX_ZOOM'],
-        tiles=None # Vamos adicionar tiles manualmente para controle total
-    )
-    
-    # Adiciona camada Base (OpenStreetMap)
-    folium.TileLayer(
-        'OpenStreetMap',
-        name='Mapa de Rua',
-        max_zoom=CONFIG['MAPA_MAX_ZOOM'],
-        control=True
-    ).add_to(m)
-    
-    # Adiciona camada de Satélite (Google Satellite) com maxNativeZoom
-    # maxNativeZoom diz ao Leaflet: "Eu tenho imagens até zoom 20, mas se o usuário der zoom 22, apenas estique a imagem do 20"
-    folium.TileLayer(
-        tiles = 'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
-        attr = 'Google',
-        name = 'Google Satélite',
-        overlay = False,
-        control = True,
-        max_zoom=CONFIG['MAPA_MAX_ZOOM'],
-        max_native_zoom=20 
-    ).add_to(m)
-
-    # Cria FeatureGroups para controle de camadas (Pontos e Linhas)
-    fg_pontos = folium.FeatureGroup(name="Pontos (Original)", show=CONFIG['PONTOS_MOSTRAR'])
-    fg_linhas = folium.FeatureGroup(name="Linhas (Calculadas)", show=CONFIG['LINHAS_MOSTRAR'])
-    # Removido grupos estáticos de cotas pois agora serão dinâmicos via JS
-    # fg_cotas_todas = ...
-    # fg_cotas_alertas = ...
-
-    # Adiciona os pontos ao FeatureGroup de pontos
-    # Usamos CircleMarker para performance e visual
-    for idx, row in gdf_mapa.iterrows():
-        # Cor baseada no AppliedRate se existir, senão padrão
-        cor = CONFIG['PONTOS_COR_PADRAO']
-        popup_txt = f"ID: {idx}"
-        
-        if 'AppliedRate' in row:
-            val = row['AppliedRate']
-            popup_txt += f"<br>Taxa: {val}"
-            if val > 0:
-                cor = CONFIG['PONTOS_COR_ATIVO']
-            else:
-                cor = CONFIG['PONTOS_COR_INATIVO']
-                
-        folium.CircleMarker(
-            location=[row.geometry.y, row.geometry.x],
-            radius=CONFIG['PONTOS_RAIO'],
-            color=cor,
-            fill=True,
-            fill_color=cor,
-            popup=folium.Popup(popup_txt, max_width=200)
-        ).add_to(fg_pontos)
-
-    # Adiciona linhas geradas ao FeatureGroup de linhas
-    if len(linhas_geradas_wgs) > 0:
-        for linha in linhas_geradas_wgs:
-            coords = [(pt[1], pt[0]) for pt in linha.coords]
-            folium.PolyLine(
-                locations=coords,
-                color=CONFIG['LINHAS_COR'],
-                weight=CONFIG['LINHAS_ESPESSURA'],
-                opacity=CONFIG['LINHAS_OPACIDADE']
-            ).add_to(fg_linhas)
-
-    # -------------------------------------------------------------------------
-    # DESENHO DAS COTAS AUTOMÁTICAS (VIA JS)
-    # -------------------------------------------------------------------------
-    # Vamos exportar os dados das cotas para uma variável JS e renderizar no cliente.
-    # Isso permite alterar cores e filtros sem recarregar o Python.
-    
-    cotas_json_data = []
-    
+    # Prepara cotas em WGS84 uma única vez
+    cotas_gdf_wgs = None
     if len(cotas_geometry) > 0:
         cotas_gdf_utm = gpd.GeoDataFrame(
             {'valor': cotas_valores, 'geometry': cotas_geometry}, 
             crs=gdf_utm.crs
         )
-        # Converte para WGS84 (Lat/Lon)
         cotas_gdf_wgs = cotas_gdf_utm.to_crs(epsg=4326)
-        
-        for idx, row in cotas_gdf_wgs.iterrows():
-            coords = [[pt[1], pt[0]] for pt in row.geometry.coords] # [[lat, lon], [lat, lon]]
-            # O valor no GeoDataFrame agora é um dicionário (devido à nossa mudança anterior), 
-            # mas o GeoPandas pode ter bagunçado se tentou salvar dict em coluna.
-            # Vamos verificar como 'cotas_valores' foi construído.
-            
-            # Na verdade, cotas_valores era uma lista de dicts: [{'val':..., 'pos':..., 'len':...}]
-            # Quando criamos o GeoDataFrame: gpd.GeoDataFrame({'valor': cotas_valores, ...})
-            # A coluna 'valor' contém os dicionários inteiros!
-            
-            dados_cota = row['valor']
-            
-            cotas_json_data.append({
-                "coords": coords,
-                "val": round(dados_cota['val'], 2),
-                "pos": round(dados_cota['pos'], 2),
-                "len": round(dados_cota['len'], 2)
-            })
 
-    # Adiciona os FeatureGroups estáticos ao mapa
-    fg_pontos.add_to(m)
-    fg_linhas.add_to(m)
-    
-    # -------------------------------------------------------------------------
-    # PAINEL DE CONTROLE JS E RENDERIZAÇÃO
-    # -------------------------------------------------------------------------
-    
-    # Converter para JSON seguro (lidando com float32/64)
-    def json_default(obj):
-        if isinstance(obj, (np.float32, np.float64)): return float(obj)
-        if isinstance(obj, (np.int32, np.int64)): return int(obj)
-        raise TypeError
-        
-    import json
-    cotas_data_str = json.dumps(cotas_json_data, default=json_default)
-    
-    control_panel_html = f"""
-    <div id="control-panel" style="
-        position: fixed; 
-        top: 10px; left: 60px; 
-        width: 300px; 
-        background: white; 
-        padding: 10px; 
-        border: 2px solid rgba(0,0,0,0.2); 
-        z-index: 1000;
-        border-radius: 5px;
-        font-family: sans-serif;
-        box-shadow: 0 0 15px rgba(0,0,0,0.2);
-        max-height: 90vh;
-        overflow-y: auto;
-    ">
-        <h4 style="margin-top:0;">🔧 Controle Total</h4>
-        
-        <!-- OFFSET -->
-        <label title="Ignorar início/fim das linhas"><b>Offset Cabeceira (m):</b> <span id="lbl_offset">20</span></label>
-        <input type="range" id="rng_offset" min="0" max="100" step="1" value="20" style="width:100%">
-        
-        <!-- INTERVALO -->
-        <label title="Distância entre medições"><b>Intervalo (m):</b> <span id="lbl_interval">10</span></label>
-        <input type="range" id="rng_interval" min="1" max="50" step="1" value="10" style="width:100%">
-        
-        <hr>
-        
-        <!-- TOLERÂNCIAS -->
-        <label><b>Tolerância Mín (m):</b> <span id="lbl_min">{CONFIG['TOLERANCIA_MIN']}</span></label>
-        <input type="range" id="rng_min" min="0" max="5" step="0.1" value="{CONFIG['TOLERANCIA_MIN']}" style="width:100%">
-        
-        <label><b>Tolerância Máx (m):</b> <span id="lbl_max">{CONFIG['TOLERANCIA_MAX']}</span></label>
-        <input type="range" id="rng_max" min="0" max="10" step="0.1" value="{CONFIG['TOLERANCIA_MAX']}" style="width:100%">
-        
-        <hr>
-        
-        <!-- CORES -->
-        <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
-            <label>Cota OK:</label>
-            <input type="color" id="col_ok" value="{CONFIG['COTA_COR_OK']}">
-        </div>
-        <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
-            <label>Cota Alerta:</label>
-            <input type="color" id="col_alert" value="{CONFIG['COTA_COR_ALERTA']}">
-        </div>
-        
-        <hr>
-        
-        <!-- VISUALIZAÇÃO -->
-        <label><input type="checkbox" id="chk_labels" checked> Mostrar Rótulos</label>
-        <br>
-        <label><input type="checkbox" id="chk_cotas" checked> Mostrar Cotas</label>
-        
-        <hr>
-        <small>Total Pontos: <span id="lbl_count">0</span></small>
-    </div>
-
-    <script>
-    // Dados injetados pelo Python
-    var cotasData = {cotas_data_str};
-    
-    var cotasLayerGroup = L.layerGroup().addTo(map);
-    var labelsLayerGroup = L.layerGroup().addTo(map);
-    
-    // Estado inicial
-    var state = {{
-        offset: 20,
-        interval: 10,
-        minTol: {CONFIG['TOLERANCIA_MIN']},
-        maxTol: {CONFIG['TOLERANCIA_MAX']},
-        colorOk: '{CONFIG['COTA_COR_OK']}',
-        colorAlert: '{CONFIG['COTA_COR_ALERTA']}',
-        showLabels: true,
-        showCotas: true
-    }};
-    
-    function updateMap() {{
-        cotasLayerGroup.clearLayers();
-        labelsLayerGroup.clearLayers();
-        
-        if (!state.showCotas) {{
-            document.getElementById('lbl_count').innerText = 0;
-            return;
-        }}
-        
-        var count = 0;
-        
-        cotasData.forEach(function(cota) {{
-            // 1. Filtro de Offset (Cabeceira)
-            // cota.pos = metros do inicio da linha
-            // cota.len = comprimento total da linha
-            if (cota.pos < state.offset || cota.pos > (cota.len - state.offset)) {{
-                return;
-            }}
-            
-            // 2. Filtro de Intervalo (Amostragem)
-            // Usamos modulo aproximado. Como os dados vêm a cada 1m (aprox), 
-            // verificamos se (pos % interval) < 1.0
-            var resto = cota.pos % state.interval;
-            if (resto > 1.1) {{ // Tolerancia de 1.1m para pegar o ponto mais próximo do intervalo
-                return;
-            }}
-            
-            count++;
-            
-            var val = cota.val;
-            var color = state.colorOk;
-            var isAlert = false;
-            
-            if (val < state.minTol || val > state.maxTol) {{
-                color = state.colorAlert;
-                isAlert = true;
-            }}
-            
-            // Desenha linha
-            L.polyline(cota.coords, {{
-                color: color,
-                weight: isAlert ? 3 : 1, 
-                opacity: 0.8
-            }}).addTo(cotasLayerGroup).bindPopup("Dist: " + val + " m");
-            
-            // Desenha Rótulo
-            if (state.showLabels) {{
-                var p1 = L.latLng(cota.coords[0]);
-                var p2 = L.latLng(cota.coords[1]);
-                var center = L.latLng((p1.lat + p2.lat)/2, (p1.lng + p2.lng)/2);
-                
-                var myIcon = L.divIcon({{
-                    className: 'cota-label',
-                    html: '<div style="color:' + color + '; font-weight:bold; font-size:10px; text-shadow: 1px 1px 1px black;">' + val + '</div>',
-                    iconSize: [30, 10],
-                    iconAnchor: [15, 5]
-                }});
-                
-                L.marker(center, {{icon: myIcon}}).addTo(labelsLayerGroup);
-            }}
-        }});
-        
-        document.getElementById('lbl_count').innerText = count;
-    }}
-    
-    // Event Listeners Genéricos
-    function bindInput(id, key, isFloat=false) {{
-        document.getElementById(id).addEventListener('input', function(e) {{
-            var val = isFloat ? parseFloat(e.target.value) : parseInt(e.target.value);
-            state[key] = val;
-            // Atualiza label se existir
-            var lbl = document.getElementById(id.replace('rng_', 'lbl_').replace('col_', 'lbl_'));
-            if(lbl) lbl.innerText = val;
-            
-            // Debounce simples para não travar
-            if(window.updateTimer) clearTimeout(window.updateTimer);
-            window.updateTimer = setTimeout(updateMap, 50); 
-        }});
-    }}
-    
-    bindInput('rng_offset', 'offset');
-    bindInput('rng_interval', 'interval');
-    bindInput('rng_min', 'minTol', true);
-    bindInput('rng_max', 'maxTol', true);
-    
-    document.getElementById('col_ok').addEventListener('input', function(e){{ state.colorOk = e.target.value; updateMap(); }});
-    document.getElementById('col_alert').addEventListener('input', function(e){{ state.colorAlert = e.target.value; updateMap(); }});
-    
-    document.getElementById('chk_labels').addEventListener('change', function(e) {{
-        state.showLabels = e.target.checked;
-        updateMap();
-    }});
-    
-    document.getElementById('chk_cotas').addEventListener('change', function(e) {{
-        state.showCotas = e.target.checked;
-        updateMap();
-    }});
-    
-    // Inicializa
-    updateMap();
-    
-    </script>
-    """
-    m.get_root().html.add_child(folium.Element(control_panel_html))
-
-    # Adiciona a tabela de estatísticas como um elemento flutuante no mapa
-    # Usamos HTML/CSS para posicionar
-    legend_html = f'''
-     <div style="position: fixed; 
-     bottom: 50px; left: 50px; width: 300px; height: auto; 
-     z-index:9999; font-size:14px;
-     background-color: white;
-     border: 2px solid grey;
-     padding: 10px;
-     opacity: 0.9;">
-     {stats_html}
-     <p><small><i>Gerado automaticamente pelo script Python</i></small></p>
-     </div>
-     '''
-    m.get_root().html.add_child(folium.Element(legend_html))
-    
-    # -------------------------------------------------------------------------
-    # SCRIPT CUSTOMIZADO: RÉGUA RÁPIDA (2 Cliques)
-    # -------------------------------------------------------------------------
-    # Injeta JavaScript para criar uma ferramenta de medição simples
-    custom_js = """
-    <script>
-    var measuring = false;
-    var measurePoints = [];
-    var measureLine = null;
-    var measureLabel = null;
-    
-    // Cria um botão personalizado no mapa
-    var btn = L.DomUtil.create('button', 'leaflet-bar leaflet-control leaflet-control-custom');
-    btn.innerHTML = '📏 Régua Rápida';
-    btn.style.backgroundColor = 'white';
-    btn.style.width = '120px';
-    btn.style.height = '30px';
-    btn.style.cursor = 'pointer';
-    btn.onclick = function(){
-        measuring = !measuring;
-        measurePoints = [];
-        if(measuring){
-            btn.innerHTML = '❌ Cancelar';
-            btn.style.backgroundColor = '#ffcccc';
-            document.getElementById('map').style.cursor = 'crosshair';
-        } else {
-            btn.innerHTML = '📏 Régua Rápida';
-            btn.style.backgroundColor = 'white';
-            document.getElementById('map').style.cursor = '';
-            if(measureLine) { map.removeLayer(measureLine); }
-            if(measureLabel) { map.removeLayer(measureLabel); }
-        }
-    }
-    
-    var container = document.getElementsByClassName('leaflet-top leaflet-right')[0];
-    container.appendChild(btn);
-    
-    // Evento de clique no mapa
-    var map = document.querySelector('.leaflet-container')._leaflet_map;
-    
-    map.on('click', function(e) {
-        if (!measuring) return;
-        
-        measurePoints.push(e.latlng);
-        
-        // Marcador temporário no ponto
-        L.circleMarker(e.latlng, {radius: 3, color: 'black'}).addTo(map).bindPopup("Pt " + measurePoints.length).openPopup();
-        
-        if (measurePoints.length == 2) {
-            var p1 = measurePoints[0];
-            var p2 = measurePoints[1];
-            
-            // Calcula distância (metros)
-            var dist = p1.distanceTo(p2).toFixed(2);
-            
-            // Desenha linha
-            measureLine = L.polyline([p1, p2], {color: 'yellow', dashArray: '10, 10', weight: 3}).addTo(map);
-            
-            // Ponto médio para o rótulo
-            var midLat = (p1.lat + p2.lat) / 2;
-            var midLng = (p1.lng + p2.lng) / 2;
-            
-            measureLabel = L.marker([midLat, midLng], {
-                icon: L.divIcon({
-                    className: 'measure-label',
-                    html: '<div style="background:white; border:1px solid black; padding:2px;">' + dist + ' m</div>'
-                })
-            }).addTo(map);
-            
-            // Reseta para próxima medição (ou encerra, dependendo do gosto)
-            // Aqui vamos resetar os pontos mas manter a linha antiga até clicar de novo? 
-            // Melhor resetar tudo no terceiro clique ou deixar acumular?
-            // O usuário pediu "2 cliques". Vamos encerrar o modo de medição ou limpar array.
-            
-            measurePoints = []; // Limpa para nova medição imediata
-            // measuring = false; // Descomente se quiser sair do modo régua após 1 medição
-        }
-    });
-    </script>
-    """
-    m.get_root().html.add_child(folium.Element(custom_js))
-
-    # Adiciona controles extras
-    folium.LayerControl().add_to(m) # Controle de camadas
-    MeasureControl(primary_length_unit='meters').add_to(m) # Ferramenta de régua padrão (backup)
-    Fullscreen().add_to(m) # Botão de tela cheia
-
-    # Salva o arquivo
+    # Garante que a pasta de saída existe
     os.makedirs(pasta_saida_mapas, exist_ok=True)
-    output_file = os.path.join(pasta_saida_mapas, 'mapa_projeto.html')
-    m.save(output_file)
-    print(f"Mapa salvo com sucesso em: {output_file}")
-    print("Abra este arquivo no seu navegador para ver o mapa e a tabela.")
+
+    # Loop para gerar mapas com diferentes densidades
+    passos = CONFIG.get('LISTA_PASSOS_VISUALIZACAO', [1])
+    
+    for passo in passos:
+        print(f"Gerando mapa para passo de visualização: {passo} (1 a cada {passo})...")
+        
+        # Cria o objeto Mapa
+        m = folium.Map(
+            location=[centro_lat, centro_lon], 
+            zoom_start=CONFIG['MAPA_ZOOM_INICIAL'], 
+            max_zoom=CONFIG['MAPA_MAX_ZOOM'],
+            tiles=None # Vamos adicionar tiles manualmente para controle total
+        )
+        
+        # Adiciona camada Base (OpenStreetMap)
+        folium.TileLayer(
+            'OpenStreetMap',
+            name='Mapa de Rua',
+            max_zoom=CONFIG['MAPA_MAX_ZOOM'],
+            control=True
+        ).add_to(m)
+        
+        # Adiciona camada de Satélite (Google Satellite)
+        folium.TileLayer(
+            tiles = 'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+            attr = 'Google',
+            name = 'Google Satélite',
+            overlay = False,
+            control = True,
+            max_zoom=CONFIG['MAPA_MAX_ZOOM'],
+            max_native_zoom=20 
+        ).add_to(m)
+
+        # Cria FeatureGroups para controle de camadas
+        fg_pontos = folium.FeatureGroup(name="Pontos (Original)", show=CONFIG['PONTOS_MOSTRAR'])
+        fg_linhas = folium.FeatureGroup(name="Linhas (Calculadas)", show=CONFIG['LINHAS_MOSTRAR'])
+        fg_cotas_todas = folium.FeatureGroup(name=f"Cotas (OK - 1/{passo})", show=CONFIG['COTAS_MOSTRAR_TODAS'])
+        fg_cotas_alertas = folium.FeatureGroup(name="Cotas (Alerta)", show=CONFIG['COTAS_MOSTRAR_ALERTAS'])
+
+        # Adiciona os pontos ao FeatureGroup de pontos
+        for idx, row in gdf_mapa.iterrows():
+            cor = CONFIG['PONTOS_COR_PADRAO']
+            popup_txt = f"ID: {idx}"
+            if 'AppliedRate' in row:
+                val = row['AppliedRate']
+                popup_txt += f"<br>Taxa: {val}"
+                if val > 0:
+                    cor = CONFIG['PONTOS_COR_ATIVO']
+                else:
+                    cor = CONFIG['PONTOS_COR_INATIVO']
+            folium.CircleMarker(
+                location=[row.geometry.y, row.geometry.x],
+                radius=CONFIG['PONTOS_RAIO'],
+                color=cor,
+                fill=True,
+                fill_color=cor,
+                popup=folium.Popup(popup_txt, max_width=200)
+            ).add_to(fg_pontos)
+
+        # Adiciona linhas geradas
+        if len(linhas_geradas_wgs) > 0:
+            for linha in linhas_geradas_wgs:
+                coords = [(pt[1], pt[0]) for pt in linha.coords]
+                folium.PolyLine(
+                    locations=coords,
+                    color=CONFIG['LINHAS_COR'],
+                    weight=CONFIG['LINHAS_ESPESSURA'],
+                    opacity=CONFIG['LINHAS_OPACIDADE']
+                ).add_to(fg_linhas)
+
+        # DESENHO DAS COTAS AUTOMÁTICAS
+        if cotas_gdf_wgs is not None:
+            for idx, row in cotas_gdf_wgs.iterrows():
+                coords = [(pt[1], pt[0]) for pt in row.geometry.coords]
+                dados_cota = row['valor']
+                val = float(dados_cota['val'])
+                is_alert = val < CONFIG['TOLERANCIA_MIN'] or val > CONFIG['TOLERANCIA_MAX']
+                
+                # Filtro de Densidade Visual (Python-side)
+                # Se não for alerta, aplica o passo de visualização
+                if not is_alert and (idx % passo != 0):
+                    continue
+                    
+                color = CONFIG['COTA_COR_ALERTA'] if is_alert else CONFIG['COTA_COR_OK']
+                target_group = fg_cotas_alertas if is_alert else fg_cotas_todas
+                
+                mid_lat = (coords[0][0] + coords[1][0]) / 2
+                mid_lon = (coords[0][1] + coords[1][1]) / 2
+                
+                # Adiciona a linha da cota
+                folium.PolyLine(
+                    locations=coords,
+                    color=color,
+                    weight=CONFIG['COTA_ESPESSURA'],
+                    opacity=0.9,
+                    popup=folium.Popup(f"Dist: {val:.2f} m", max_width=200)
+                ).add_to(target_group)
+                
+                # Adiciona o rótulo
+                text_color = 'white' if is_alert else 'black'
+                bg_color = 'red' if is_alert else 'rgba(255,255,255,0.7)'
+                border_color = color
+                
+                folium.map.Marker(
+                    [mid_lat, mid_lon],
+                    icon=folium.DivIcon(
+                        icon_size=(150,36),
+                        icon_anchor=(75,18),
+                        html=f'<div style="font-size: 10pt; font-weight: bold; color: {text_color}; background: {bg_color}; border: 1px solid {border_color}; border-radius: 4px; text-align: center; width: auto; padding: 2px; display: inline-block;">{val:.2f}m</div>'
+                    )
+                ).add_to(target_group)
+
+        # Adiciona os FeatureGroups ao mapa
+        fg_pontos.add_to(m)
+        fg_linhas.add_to(m)
+        fg_cotas_todas.add_to(m)
+        fg_cotas_alertas.add_to(m)
+
+        # Adiciona a tabela de estatísticas
+        legend_html = f'''
+         <div style="position: fixed; 
+         bottom: 50px; left: 50px; width: 320px; height: auto; 
+         z-index:9999; font-size:14px;
+         background-color: white;
+         border: 2px solid grey;
+         padding: 10px;
+         opacity: 0.95;
+         box-shadow: 0 0 10px rgba(0,0,0,0.2);">
+         
+         {stats_html}
+         <p><small><i>Densidade Visual: 1 a cada {passo} cotas (OK).</i></small></p>
+         </div>
+         '''
+        m.get_root().html.add_child(folium.Element(legend_html))
+        
+        # Controles finais
+        folium.LayerControl().add_to(m)
+        Fullscreen().add_to(m)
+
+        # Salva o arquivo específico
+        nome_arquivo = f'mapa_projeto_densidade_{passo}.html'
+        output_file = os.path.join(pasta_saida_mapas, nome_arquivo)
+        m.save(output_file)
+        print(f"Mapa salvo com sucesso em: {output_file}")
+        
+        # Se for o passo 1 (padrão), salva também como mapa_projeto.html para facilitar
+        if passo == 1:
+             output_file_default = os.path.join(pasta_saida_mapas, 'mapa_projeto.html')
+             m.save(output_file_default)
+
+    print("Todos os mapas foram gerados com sucesso.")
 
 if __name__ == "__main__":
     diretorio_atual = os.path.dirname(os.path.abspath(__file__))
