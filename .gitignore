@@ -1,0 +1,20 @@
+# Arquivos de dados
+*.zip
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.json
+
+# Pastas de saída e dados
+doc/
+dados_extraidos/
+mapas/
+__pycache__/
+*.pyc
+
+# IDE e Sistema
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,7 @@
+geopandas
+shapely
+pyproj
+scikit-learn
+folium
+matplotlib
+mapclassify
