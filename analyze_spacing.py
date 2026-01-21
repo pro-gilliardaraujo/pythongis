@@ -48,7 +48,7 @@ CONFIG = {
     # Parâmetros de Cálculo de Espaçamento
     # NOTA: Agora o Python gera um SUPERSET (alta densidade).
     # O filtro real de amostragem e offset será feito no JS.
-    'OFFSET_CABECEIRA_METROS': 0.0, # Python gera tudo, JS filtra
+    'OFFSET_CABECEIRA_METROS': 10.0, # Python gera tudo, JS filtra
     'AMOSTRAGEM_DIST_METROS': 1.0, # Alta densidade para o JS ter liberdade
     'FILTRO_DIST_MIN': 0.1, 
     'FILTRO_DIST_MAX': 100.0, 
@@ -517,14 +517,20 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
     # PAINEL DE CONTROLE JS E RENDERIZAÇÃO
     # -------------------------------------------------------------------------
     
+    # Converter para JSON seguro (lidando com float32/64)
+    def json_default(obj):
+        if isinstance(obj, (np.float32, np.float64)): return float(obj)
+        if isinstance(obj, (np.int32, np.int64)): return int(obj)
+        raise TypeError
+        
     import json
-    cotas_data_str = json.dumps(cotas_json_data)
+    cotas_data_str = json.dumps(cotas_json_data, default=json_default)
     
     control_panel_html = f"""
     <div id="control-panel" style="
         position: fixed; 
         top: 10px; left: 60px; 
-        width: 250px; 
+        width: 300px; 
         background: white; 
         padding: 10px; 
         border: 2px solid rgba(0,0,0,0.2); 
@@ -532,9 +538,22 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
         border-radius: 5px;
         font-family: sans-serif;
         box-shadow: 0 0 15px rgba(0,0,0,0.2);
+        max-height: 90vh;
+        overflow-y: auto;
     ">
-        <h4 style="margin-top:0;">🔧 Controles</h4>
+        <h4 style="margin-top:0;">🔧 Controle Total</h4>
         
+        <!-- OFFSET -->
+        <label title="Ignorar início/fim das linhas"><b>Offset Cabeceira (m):</b> <span id="lbl_offset">20</span></label>
+        <input type="range" id="rng_offset" min="0" max="100" step="1" value="20" style="width:100%">
+        
+        <!-- INTERVALO -->
+        <label title="Distância entre medições"><b>Intervalo (m):</b> <span id="lbl_interval">10</span></label>
+        <input type="range" id="rng_interval" min="1" max="50" step="1" value="10" style="width:100%">
+        
+        <hr>
+        
+        <!-- TOLERÂNCIAS -->
         <label><b>Tolerância Mín (m):</b> <span id="lbl_min">{CONFIG['TOLERANCIA_MIN']}</span></label>
         <input type="range" id="rng_min" min="0" max="5" step="0.1" value="{CONFIG['TOLERANCIA_MIN']}" style="width:100%">
         
@@ -542,12 +561,26 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
         <input type="range" id="rng_max" min="0" max="10" step="0.1" value="{CONFIG['TOLERANCIA_MAX']}" style="width:100%">
         
         <hr>
-        <label><input type="checkbox" id="chk_labels" checked> Mostrar Rótulos (Distância)</label>
-        <br>
-        <label><input type="checkbox" id="chk_cotas" checked> Mostrar Linhas de Cota</label>
+        
+        <!-- CORES -->
+        <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
+            <label>Cota OK:</label>
+            <input type="color" id="col_ok" value="{CONFIG['COTA_COR_OK']}">
+        </div>
+        <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
+            <label>Cota Alerta:</label>
+            <input type="color" id="col_alert" value="{CONFIG['COTA_COR_ALERTA']}">
+        </div>
         
         <hr>
-        <small>Total Cotas: {len(cotas_json_data)}</small>
+        
+        <!-- VISUALIZAÇÃO -->
+        <label><input type="checkbox" id="chk_labels" checked> Mostrar Rótulos</label>
+        <br>
+        <label><input type="checkbox" id="chk_cotas" checked> Mostrar Cotas</label>
+        
+        <hr>
+        <small>Total Pontos: <span id="lbl_count">0</span></small>
     </div>
 
     <script>
@@ -557,38 +590,65 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
     var cotasLayerGroup = L.layerGroup().addTo(map);
     var labelsLayerGroup = L.layerGroup().addTo(map);
     
-    var minTol = {CONFIG['TOLERANCIA_MIN']};
-    var maxTol = {CONFIG['TOLERANCIA_MAX']};
-    var showLabels = true;
-    var showCotas = true;
+    // Estado inicial
+    var state = {{
+        offset: 20,
+        interval: 10,
+        minTol: {CONFIG['TOLERANCIA_MIN']},
+        maxTol: {CONFIG['TOLERANCIA_MAX']},
+        colorOk: '{CONFIG['COTA_COR_OK']}',
+        colorAlert: '{CONFIG['COTA_COR_ALERTA']}',
+        showLabels: true,
+        showCotas: true
+    }};
     
     function updateMap() {{
         cotasLayerGroup.clearLayers();
         labelsLayerGroup.clearLayers();
         
-        if (!showCotas) return;
+        if (!state.showCotas) {{
+            document.getElementById('lbl_count').innerText = 0;
+            return;
+        }}
+        
+        var count = 0;
         
         cotasData.forEach(function(cota) {{
+            // 1. Filtro de Offset (Cabeceira)
+            // cota.pos = metros do inicio da linha
+            // cota.len = comprimento total da linha
+            if (cota.pos < state.offset || cota.pos > (cota.len - state.offset)) {{
+                return;
+            }}
+            
+            // 2. Filtro de Intervalo (Amostragem)
+            // Usamos modulo aproximado. Como os dados vêm a cada 1m (aprox), 
+            // verificamos se (pos % interval) < 1.0
+            var resto = cota.pos % state.interval;
+            if (resto > 1.1) {{ // Tolerancia de 1.1m para pegar o ponto mais próximo do intervalo
+                return;
+            }}
+            
+            count++;
+            
             var val = cota.val;
-            var color = '{CONFIG['COTA_COR_OK']}'; // Verde
+            var color = state.colorOk;
             var isAlert = false;
             
-            if (val < minTol || val > maxTol) {{
-                color = '{CONFIG['COTA_COR_ALERTA']}'; // Magenta
+            if (val < state.minTol || val > state.maxTol) {{
+                color = state.colorAlert;
                 isAlert = true;
             }}
             
             // Desenha linha
             L.polyline(cota.coords, {{
                 color: color,
-                weight: isAlert ? 3 : 1, // Alerta mais grosso
+                weight: isAlert ? 3 : 1, 
                 opacity: 0.8
             }}).addTo(cotasLayerGroup).bindPopup("Dist: " + val + " m");
             
-            // Desenha Rótulo (apenas se checkbox ativo)
-            // Para não poluir, mostramos rótulos apenas para alertas ou se o zoom for alto?
-            // O usuário pediu "já deixar visivel". Vamos colocar em todos por enquanto.
-            if (showLabels) {{
+            // Desenha Rótulo
+            if (state.showLabels) {{
                 var p1 = L.latLng(cota.coords[0]);
                 var p2 = L.latLng(cota.coords[1]);
                 var center = L.latLng((p1.lat + p2.lat)/2, (p1.lng + p2.lng)/2);
@@ -603,36 +663,45 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                 L.marker(center, {{icon: myIcon}}).addTo(labelsLayerGroup);
             }}
         }});
+        
+        document.getElementById('lbl_count').innerText = count;
     }}
     
-    // Event Listeners
-    document.getElementById('rng_min').addEventListener('input', function(e) {{
-        minTol = parseFloat(e.target.value);
-        document.getElementById('lbl_min').innerText = minTol;
-        updateMap();
-    }});
+    // Event Listeners Genéricos
+    function bindInput(id, key, isFloat=false) {{
+        document.getElementById(id).addEventListener('input', function(e) {{
+            var val = isFloat ? parseFloat(e.target.value) : parseInt(e.target.value);
+            state[key] = val;
+            // Atualiza label se existir
+            var lbl = document.getElementById(id.replace('rng_', 'lbl_').replace('col_', 'lbl_'));
+            if(lbl) lbl.innerText = val;
+            
+            // Debounce simples para não travar
+            if(window.updateTimer) clearTimeout(window.updateTimer);
+            window.updateTimer = setTimeout(updateMap, 50); 
+        }});
+    }}
     
-    document.getElementById('rng_max').addEventListener('input', function(e) {{
-        maxTol = parseFloat(e.target.value);
-        document.getElementById('lbl_max').innerText = maxTol;
-        updateMap();
-    }});
+    bindInput('rng_offset', 'offset');
+    bindInput('rng_interval', 'interval');
+    bindInput('rng_min', 'minTol', true);
+    bindInput('rng_max', 'maxTol', true);
+    
+    document.getElementById('col_ok').addEventListener('input', function(e){{ state.colorOk = e.target.value; updateMap(); }});
+    document.getElementById('col_alert').addEventListener('input', function(e){{ state.colorAlert = e.target.value; updateMap(); }});
     
     document.getElementById('chk_labels').addEventListener('change', function(e) {{
-        showLabels = e.target.checked;
+        state.showLabels = e.target.checked;
         updateMap();
     }});
     
     document.getElementById('chk_cotas').addEventListener('change', function(e) {{
-        showCotas = e.target.checked;
+        state.showCotas = e.target.checked;
         updateMap();
     }});
     
     // Inicializa
     updateMap();
-    
-    // Ajusta z-index do controle para ficar acima do mapa
-    var mapContainer = document.querySelector('.leaflet-container');
     
     </script>
     """
