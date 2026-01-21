@@ -224,6 +224,11 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
 
     print(f"Carregados {len(gdf)} elementos.")
 
+    # Calcula nome base do arquivo (Data de Ontem) para uso no Título e Nome do Arquivo
+    ontem = datetime.now() - timedelta(days=1)
+    data_str = ontem.strftime('%d-%m-%Y')
+    nome_base_titulo = f"Mapa Espaçamento Plantio - {data_str}"
+
     # ---------------------------------------------------------
     # 1. CONVERSÃO DE COORDENADAS (PROJEÇÃO)
     # ---------------------------------------------------------
@@ -262,7 +267,7 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
     # ---------------------------------------------------------
     # 3. CÁLCULO DE ESPAÇAMENTO (ESTIMATIVA)
     # ---------------------------------------------------------
-    stats_html = "<h3>Relatório de Espaçamento</h3>"
+    stats_html = f"<h3>{nome_base_titulo}</h3>"
     
     # Filtra apenas pontos para análise
     pontos = gdf_utm[gdf_utm.geometry.type.isin(['Point', 'MultiPoint'])].copy()
@@ -644,9 +649,23 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                     continue
 
                 # Filtro de Densidade Visual (Python-side)
-                # Se não for alerta, aplica o passo de visualização
-                if not is_alert and (idx % passo != 0):
-                    continue
+                # Se não for alerta, aplica lógica de amostragem por zoom (Classes CSS)
+                # is_alert cotas são sempre mostradas (exceto se layer desligada)
+                
+                # Classes de Amostragem:
+                # cota-lvl-1: Mostra em Zoom Baixo (A cada 20 pontos)
+                # cota-lvl-2: Mostra em Zoom Médio (A cada 5 pontos)
+                # cota-lvl-3: Mostra em Zoom Alto (Todos os pontos)
+                
+                zoom_class = ""
+                if is_alert:
+                    zoom_class = "cota-alert"
+                elif idx % 20 == 0:
+                    zoom_class = "cota-lvl-1"
+                elif idx % 5 == 0:
+                    zoom_class = "cota-lvl-2"
+                else:
+                    zoom_class = "cota-lvl-3"
                     
                 color = CONFIG['COTA_COR_ALERTA'] if is_alert else CONFIG['COTA_COR_OK']
                 target_group = fg_cotas_alertas if is_alert else fg_cotas_todas
@@ -655,6 +674,8 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                 mid_lon = (coords[0][1] + coords[1][1]) / 2
                 
                 # Adiciona a linha da cota
+                # Linhas também recebem classe para sumir se necessário?
+                # Por enquanto, apenas os labels (caixinhas) incomodam mais.
                 folium.PolyLine(
                     locations=coords,
                     color=color,
@@ -673,7 +694,7 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                     icon=folium.DivIcon(
                         icon_size=(150,36),
                         icon_anchor=(75,18),
-                        class_name='cota-marker-container',
+                        class_name=f'cota-marker-container {zoom_class}',
                         html=f'<div style="font-size: 10pt; font-weight: bold; color: {text_color}; background: {bg_color}; border: 1px solid {border_color}; border-radius: 4px; text-align: center; width: auto; padding: 2px; display: inline-block;">{val:.2f}m</div>'
                     )
                 ).add_to(target_group)
@@ -726,7 +747,25 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
             }
             
             /* Oculta cotas em zoom baixo (controlado via JS) */
-            .hide-cota-markers .cota-marker-container {
+            /* Por padrão, esconde niveis de detalhe (lvl 2 e 3) */
+            /* Lvl 1 é sempre visível se não tiver classe global de hide */
+            
+            .cota-lvl-2, .cota-lvl-3 {
+                display: none !important;
+            }
+            
+            /* Quando tiver classe 'show-lvl-2' no mapa, mostra lvl 2 */
+            .show-lvl-2 .cota-lvl-2 {
+                display: inline-block !important;
+            }
+            
+            /* Quando tiver classe 'show-lvl-3' no mapa, mostra lvl 3 */
+            .show-lvl-3 .cota-lvl-3 {
+                display: inline-block !important;
+            }
+            
+            /* Classe global para esconder TUDO (zoom muito longe) */
+            .hide-all-cotas .cota-marker-container {
                 display: none !important;
             }
 
@@ -821,33 +860,52 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                 var map = {map_id};
                 
                 // Define o zoom mínimo para exibir as cotas
-                // Lógica: Exibir apenas nos níveis mais próximos (Zoom In).
-                // Ocultar nos níveis mais distantes (Zoom Out).
-                // Baseado na solicitação: "aparecerem só após o quarto nível de zoom" (contando do mais distante).
-                // Capturamos o zoom inicial (fitBounds) e definimos um offset.
+                // Lógica de Amostragem por Nível de Zoom
                 
                 // Aguarda um pouco para o fitBounds ocorrer
                 setTimeout(function() {{
                     var initialZoom = map.getZoom();
-                    // Se o usuário tem ~9 níveis de zoom out, e quer ver após o 4º.
-                    // Significa que os 4 níveis mais baixos (distantes) ficam ocultos.
-                    // Threshold = InitialZoom - 5.
-                    var minVisibleZoom = initialZoom - 5; 
                     
-                    console.log("Zoom Logic Init: Initial=" + initialZoom + ", MinVisible=" + minVisibleZoom);
+                    // Definição de Limiares (Thresholds) relativos ao zoom inicial
+                    // Zoom Baixo (Longe): Mostra apenas lvl 1 (1/20)
+                    // Zoom Médio: Mostra lvl 1 + lvl 2 (1/5)
+                    // Zoom Alto (Perto): Mostra tudo (1/1)
+                    
+                    // Exemplo: Se Initial = 18.
+                    // < 15: Esconde tudo (Opcional, ou mostra só lvl 1)
+                    // 15 - 16: Lvl 1
+                    // 17: Lvl 1 + 2
+                    // >= 18: Tudo
+                    
+                    var zoomThresholdLow = initialZoom - 4; // Abaixo disso, esconde tudo ou mostra muito pouco
+                    var zoomThresholdMid = initialZoom - 2; // Começa a mostrar médio
+                    var zoomThresholdHigh = initialZoom;    // Mostra tudo
+                    
+                    console.log("Zoom Logic Init: Initial=" + initialZoom);
 
                     function updateCotaVisibility() {{
                         var currentZoom = map.getZoom();
                         var mapContainer = map.getContainer();
+                        var classList = mapContainer.classList;
                         
-                        if (currentZoom < minVisibleZoom) {{
-                            if (!mapContainer.classList.contains('hide-cota-markers')) {{
-                                mapContainer.classList.add('hide-cota-markers');
-                            }}
+                        // Limpa estados
+                        classList.remove('hide-all-cotas');
+                        classList.remove('show-lvl-2');
+                        classList.remove('show-lvl-3');
+                        
+                        if (currentZoom < zoomThresholdLow) {{
+                            // Zoom muito longe: Esconde tudo para limpar a visão
+                            classList.add('hide-all-cotas');
+                        }} else if (currentZoom < zoomThresholdMid) {{
+                            // Zoom baixo: Mostra apenas Lvl 1 (padrão CSS, sem classes extras)
+                            // Nenhuma ação necessária, pois lvl 2 e 3 estão hidden por CSS padrão
+                        }} else if (currentZoom < zoomThresholdHigh) {{
+                            // Zoom médio: Mostra Lvl 1 + Lvl 2
+                            classList.add('show-lvl-2');
                         }} else {{
-                            if (mapContainer.classList.contains('hide-cota-markers')) {{
-                                mapContainer.classList.remove('hide-cota-markers');
-                            }}
+                            // Zoom alto: Mostra Tudo
+                            classList.add('show-lvl-2');
+                            classList.add('show-lvl-3');
                         }}
                     }}
                     
