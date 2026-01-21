@@ -913,20 +913,50 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                     
                     // Executa verificação inicial
                     updateCotaVisibility();
+                    
+                    // MOSTRADOR DE ZOOM (SOLICITADO PELO USUÁRIO)
+                    var zoomDisplay = document.createElement('div');
+                    zoomDisplay.style.position = 'fixed';
+                    zoomDisplay.style.top = '10px';
+                    zoomDisplay.style.left = '50%';
+                    zoomDisplay.style.transform = 'translateX(-50%)';
+                    zoomDisplay.style.backgroundColor = 'rgba(0, 0, 0, 0.7)';
+                    zoomDisplay.style.color = 'white';
+                    zoomDisplay.style.padding = '5px 10px';
+                    zoomDisplay.style.borderRadius = '5px';
+                    zoomDisplay.style.fontSize = '14px';
+                    zoomDisplay.style.zIndex = '9999';
+                    zoomDisplay.style.pointerEvents = 'none'; // Não interfere no mapa
+                    document.body.appendChild(zoomDisplay);
+
+                    function updateZoomDisplay() {{
+                          var z = map.getZoom();
+                          zoomDisplay.innerHTML = 'Zoom Atual: ' + z;
+                     }}
+                     map.on('zoomend', updateZoomDisplay);
+                     updateZoomDisplay();
+
                 }}, 1000);
             }});
         </script>
         """
-        
-        m.get_root().html.add_child(folium.Element(css_style))
-        m.get_root().html.add_child(folium.Element(js_move_layers))
-        m.get_root().html.add_child(folium.Element(js_zoom_logic))
 
         legend_html = f'''
         <div class="info-panel">
             {stats_html}
+            <div style="margin-top: 10px; font-size: 0.9em; color: #555;">
+               <hr>
+               <b>Legenda de Zoom:</b><br>
+               Zoom Baixo: Oculta Cotas<br>
+               Zoom Médio: Mostra Algumas<br>
+               Zoom Alto: Mostra Todas
+            </div>
         </div>
         '''
+        
+        m.get_root().html.add_child(folium.Element(css_style))
+        m.get_root().html.add_child(folium.Element(js_move_layers))
+        m.get_root().html.add_child(folium.Element(js_zoom_logic))
         
         m.get_root().html.add_child(folium.Element(legend_html))
         
