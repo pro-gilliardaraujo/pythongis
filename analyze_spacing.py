@@ -2,12 +2,14 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 from shapely.geometry import Point, LineString
+from shapely.ops import substring
 import math
 import os
 import glob
 import zipfile
 import folium
 from folium.plugins import MeasureControl, Fullscreen
+from datetime import datetime, timedelta
 
 # ==============================================================================
 # CONFIGURAÇÕES GERAIS - Ajuste aqui os parâmetros de análise e visualização
@@ -16,27 +18,41 @@ CONFIG = {
     # Visualização do Mapa
     'MAPA_ZOOM_INICIAL': 18,
     'MAPA_MAX_ZOOM': 24, # Permite zoom muito alto
+    'MAPA_LIMITAR_VISAO_AO_PROJETO': True, # Restringe a navegação à área do projeto (remove "background infinito")
+    
+    # Configuração de Camadas (Layers)
+    'GERAR_CAMADAS_OCULTAS': False, # OTIMIZAÇÃO: Se False, não gera dados para camadas marcadas como False (Reduz tamanho do arquivo)
+    'LAYER_NAME_PONTOS': 'Pontos (Original)',
+    'LAYER_SHOW_PONTOS': False, 
+    'LAYER_NAME_LINHAS': 'Linhas (Calculadas)',
+    'LAYER_SHOW_LINHAS': False,
+    'LAYER_NAME_COTAS_OK': 'Cotas (OK)',
+    'LAYER_SHOW_COTAS_OK': False,
+    'LAYER_NAME_COTAS_ALERTA': 'Cotas (Fora)',
+    'LAYER_SHOW_COTAS_ALERTA': True,
+    'LAYER_NAME_HEATMAP': 'Mapa de Tendência',
+    'LAYER_SHOW_HEATMAP': True,
     
     # Estilo dos Pontos
-    'PONTOS_MOSTRAR': True,
     'PONTOS_RAIO': 1,
     'PONTOS_COR_PADRAO': '#FF4500', # OrangeRed
     'PONTOS_COR_ATIVO': '#00FF00', # Lime
     'PONTOS_COR_INATIVO': '#FF0000', # Red
     
     # Estilo das Linhas Geradas (Passadas)
-    'LINHAS_MOSTRAR': True,
     'LINHAS_COR': '#00FFFF', # Cyan
     'LINHAS_ESPESSURA': 3,
     'LINHAS_OPACIDADE': 0.6,
     
     # Estilo das Cotas Automáticas (Medições)
-    'COTAS_MOSTRAR_TODAS': True,
-    'COTAS_MOSTRAR_ALERTAS': True, 
-    'LISTA_PASSOS_VISUALIZACAO': [10], # Gera mapas para cada passo: 1=Todas, 2=50%, 5=20%, etc.
-    'COTA_COR_OK': '#00FF00', # Verde (dentro do padrão)
-    'COTA_COR_ALERTA': '#FF0000', # Vermelho (fora do padrão - ALERTA)
+    'LISTA_PASSOS_VISUALIZACAO': [10], # Gera mapas para cada passo (1 = Todas as cotas)
+    'COTA_COR_OK': '#00FF00', # Verde
+    'COTA_COR_ALERTA': '#FF0000', # Vermelho
     'COTA_ESPESSURA': 2,
+    
+    # Estilo Mapa de Calor
+    'HEATMAP_ESPESSURA': 7, # Linha grossa
+    'HEATMAP_OPACIDADE': 0.7,
     
     # Parâmetros de Tolerância (O que é aceitável?)
     'TOLERANCIA_MIN': 2.9, # Abaixo disso é alerta
@@ -290,6 +306,9 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
         cotas_geometry = []
         cotas_valores = []
         
+        heatmap_segments_utm = []
+        heatmap_values = []
+        
         if len(linhas_geradas) > 1:
             print("Calculando distâncias LATERAIS (Swath) entre linhas geradas...")
             linhas_gdf = gpd.GeoDataFrame(geometry=linhas_geradas, crs=gdf_utm.crs)
@@ -395,6 +414,21 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                         if min_dist > limite_descarte:
                             continue
 
+                        # --- GERAÇÃO DO MAPA DE CALOR (HEATMAP) ---
+                        # Gera um segmento da linha original colorido conforme a qualidade
+                        # Usamos substring para pegar um pedaço da linha em torno do ponto de amostragem
+                        half_sample = CONFIG['AMOSTRAGEM_DIST_METROS'] / 2
+                        h_start = max(0, dist_from_start - half_sample)
+                        h_end = min(length, dist_from_start + half_sample)
+                        
+                        try:
+                            # Recorta o segmento da linha original
+                            seg_geom = substring(geom, h_start, h_end)
+                            heatmap_segments_utm.append(seg_geom)
+                            heatmap_values.append(min_dist)
+                        except Exception as e:
+                            pass # Ignora erros de geometria pontuais
+
                         # --- FILTRO 2: Limpeza visual de cotas muito próximas na mesma linha ---
                         if (dist_from_start - ultimo_pos_valida) < CONFIG['MIN_DIST_ENTRE_COTAS_MESMA_LINHA']:
                              continue
@@ -449,17 +483,17 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
             print(f"Mediana Estimada (Robusta): {mediana:.2f} m")
             print(f"Mínimo Absoluto: {minimo:.2f} m")
             
-            # Adiciona ao HTML
+            # CÁLCULO DO TIRO MÉDIO
+            # O 'tiro' é o comprimento de cada segmento contínuo (linha gerada)
+            comprimentos_tiros = [linha.length for linha in linhas_geradas]
+            tiro_medio = np.mean(comprimentos_tiros) if comprimentos_tiros else 0
+            
+            # Adiciona ao HTML (SIMPLIFICADO)
             stats_html += f"""
             <table border="1" style="border-collapse: collapse; width: 100%;">
-                <tr><td><b>Média (Robusta)</b></td><td>{media:.2f} m</td></tr>
-                <tr><td><b>Mediana (Robusta)</b></td><td>{mediana:.2f} m</td></tr>
-                <tr><td><b>Mínimo</b></td><td>{minimo:.2f} m</td></tr>
-                <tr><td><b>Máximo</b></td><td>{maximo:.2f} m</td></tr>
-                <tr><td><b>Amostras Totais</b></td><td>{len(distancias_validas)}</td></tr>
-                <tr><td><b>Amostras Úteis</b></td><td>{len(distancias_robustas)}</td></tr>
+                <tr><td><b>Espaçamento médio</b></td><td>{media:.2f} m</td></tr>
+                <tr><td><b>Tiro médio</b></td><td>{tiro_medio:.2f} m</td></tr>
             </table>
-            <p><small>*Valores robustos ignoram outliers (IQR filter).</small></p>
             """
         else:
             print("Não foi possível determinar o espaçamento entre linhas (talvez seja passe único).")
@@ -482,6 +516,16 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
     centro_lat = gdf_mapa.geometry.y.mean()
     centro_lon = gdf_mapa.geometry.x.mean()
     
+    # Calcula limites para restringir a visão (max_bounds)
+    min_x, min_y, max_x, max_y = gdf_mapa.total_bounds
+    # Adiciona uma margem de 10%
+    margem_x = (max_x - min_x) * 0.1
+    margem_y = (max_y - min_y) * 0.1
+    bounds_projeto = [
+        [min_y - margem_y, min_x - margem_x], # Sudoeste
+        [max_y + margem_y, max_x + margem_x]  # Nordeste
+    ]
+    
     # Prepara cotas em WGS84 uma única vez
     cotas_gdf_wgs = None
     if len(cotas_geometry) > 0:
@@ -490,6 +534,15 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
             crs=gdf_utm.crs
         )
         cotas_gdf_wgs = cotas_gdf_utm.to_crs(epsg=4326)
+
+    # Prepara Heatmap em WGS84
+    heatmap_gdf_wgs = None
+    if len(heatmap_segments_utm) > 0:
+        heatmap_gdf_utm = gpd.GeoDataFrame(
+            {'valor': heatmap_values, 'geometry': heatmap_segments_utm},
+            crs=gdf_utm.crs
+        )
+        heatmap_gdf_wgs = heatmap_gdf_utm.to_crs(epsg=4326)
 
     # Garante que a pasta de saída existe
     os.makedirs(pasta_saida_mapas, exist_ok=True)
@@ -501,60 +554,67 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
         print(f"Gerando mapa para passo de visualização: {passo} (1 a cada {passo})...")
         
         # Cria o objeto Mapa
-        m = folium.Map(
-            location=[centro_lat, centro_lon], 
-            zoom_start=CONFIG['MAPA_ZOOM_INICIAL'], 
-            max_zoom=CONFIG['MAPA_MAX_ZOOM'],
-            tiles=None # Vamos adicionar tiles manualmente para controle total
-        )
+        # Configura restrição de visão se solicitado
+        kwargs_mapa = {
+            'location': [centro_lat, centro_lon],
+            'zoom_start': CONFIG['MAPA_ZOOM_INICIAL'],
+            'max_zoom': CONFIG['MAPA_MAX_ZOOM'],
+            'tiles': None,
+            'attr_prefix': False # Remove o prefixo "Leaflet"
+        }
         
-        # Adiciona camada Base (OpenStreetMap)
-        folium.TileLayer(
-            'OpenStreetMap',
-            name='Mapa de Rua',
-            max_zoom=CONFIG['MAPA_MAX_ZOOM'],
-            control=True
-        ).add_to(m)
+        m = folium.Map(**kwargs_mapa)
         
-        # Adiciona camada de Satélite (Google Satellite)
+        # Sempre ajusta o zoom para caber o projeto na tela (Responsividade)
+        m.fit_bounds(bounds_projeto)
+        
+        # Prepara bounds para o TileLayer (Leaflet usa [[lat,lon], [lat,lon]])
+        # O bounds_projeto já está nesse formato
+        tile_bounds = bounds_projeto if CONFIG['MAPA_LIMITAR_VISAO_AO_PROJETO'] else None
+
+        # Adiciona camada de Satélite (Google Satellite) - ÚNICA CAMADA BASE
         folium.TileLayer(
             tiles = 'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
-            attr = 'Google',
+            attr = ' ', # Remove atribuição textual (vazio)
             name = 'Google Satélite',
             overlay = False,
-            control = True,
+            control = False, # Remove do controle de camadas
             max_zoom=CONFIG['MAPA_MAX_ZOOM'],
-            max_native_zoom=20 
+            max_native_zoom=20,
+            bounds=tile_bounds
         ).add_to(m)
 
         # Cria FeatureGroups para controle de camadas
-        fg_pontos = folium.FeatureGroup(name="Pontos (Original)", show=CONFIG['PONTOS_MOSTRAR'])
-        fg_linhas = folium.FeatureGroup(name="Linhas (Calculadas)", show=CONFIG['LINHAS_MOSTRAR'])
-        fg_cotas_todas = folium.FeatureGroup(name=f"Cotas (OK - 1/{passo})", show=CONFIG['COTAS_MOSTRAR_TODAS'])
-        fg_cotas_alertas = folium.FeatureGroup(name="Cotas (Alerta)", show=CONFIG['COTAS_MOSTRAR_ALERTAS'])
+        fg_pontos = folium.FeatureGroup(name=CONFIG['LAYER_NAME_PONTOS'], show=CONFIG['LAYER_SHOW_PONTOS'])
+        fg_linhas = folium.FeatureGroup(name=CONFIG['LAYER_NAME_LINHAS'], show=CONFIG['LAYER_SHOW_LINHAS'])
+        fg_cotas_todas = folium.FeatureGroup(name=f"{CONFIG['LAYER_NAME_COTAS_OK']} (1/{passo})", show=CONFIG['LAYER_SHOW_COTAS_OK'])
+        fg_cotas_alertas = folium.FeatureGroup(name=CONFIG['LAYER_NAME_COTAS_ALERTA'], show=CONFIG['LAYER_SHOW_COTAS_ALERTA'])
+        fg_heatmap = folium.FeatureGroup(name=CONFIG['LAYER_NAME_HEATMAP'], show=CONFIG['LAYER_SHOW_HEATMAP'])
 
         # Adiciona os pontos ao FeatureGroup de pontos
-        for idx, row in gdf_mapa.iterrows():
-            cor = CONFIG['PONTOS_COR_PADRAO']
-            popup_txt = f"ID: {idx}"
-            if 'AppliedRate' in row:
-                val = row['AppliedRate']
-                popup_txt += f"<br>Taxa: {val}"
-                if val > 0:
-                    cor = CONFIG['PONTOS_COR_ATIVO']
-                else:
-                    cor = CONFIG['PONTOS_COR_INATIVO']
-            folium.CircleMarker(
-                location=[row.geometry.y, row.geometry.x],
-                radius=CONFIG['PONTOS_RAIO'],
-                color=cor,
-                fill=True,
-                fill_color=cor,
-                popup=folium.Popup(popup_txt, max_width=200)
-            ).add_to(fg_pontos)
+        # OTIMIZAÇÃO: Só adiciona se o layer estiver visível ou se a configuração permitir gerar ocultos
+        if CONFIG['GERAR_CAMADAS_OCULTAS'] or CONFIG['LAYER_SHOW_PONTOS']:
+            for idx, row in gdf_mapa.iterrows():
+                cor = CONFIG['PONTOS_COR_PADRAO']
+                popup_txt = f"ID: {idx}"
+                if 'AppliedRate' in row:
+                    val = row['AppliedRate']
+                    popup_txt += f"<br>Taxa: {val}"
+                    if val > 0:
+                        cor = CONFIG['PONTOS_COR_ATIVO']
+                    else:
+                        cor = CONFIG['PONTOS_COR_INATIVO']
+                folium.CircleMarker(
+                    location=[row.geometry.y, row.geometry.x],
+                    radius=CONFIG['PONTOS_RAIO'],
+                    color=cor,
+                    fill=True,
+                    fill_color=cor,
+                    popup=folium.Popup(popup_txt, max_width=200)
+                ).add_to(fg_pontos)
 
         # Adiciona linhas geradas
-        if len(linhas_geradas_wgs) > 0:
+        if (CONFIG['GERAR_CAMADAS_OCULTAS'] or CONFIG['LAYER_SHOW_LINHAS']) and len(linhas_geradas_wgs) > 0:
             for linha in linhas_geradas_wgs:
                 coords = [(pt[1], pt[0]) for pt in linha.coords]
                 folium.PolyLine(
@@ -565,13 +625,24 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                 ).add_to(fg_linhas)
 
         # DESENHO DAS COTAS AUTOMÁTICAS
-        if cotas_gdf_wgs is not None:
+        # OTIMIZAÇÃO: Verifica se deve gerar cotas
+        gerar_cotas_ok = CONFIG['GERAR_CAMADAS_OCULTAS'] or CONFIG['LAYER_SHOW_COTAS_OK']
+        gerar_cotas_alerta = CONFIG['GERAR_CAMADAS_OCULTAS'] or CONFIG['LAYER_SHOW_COTAS_ALERTA']
+        
+        if (gerar_cotas_ok or gerar_cotas_alerta) and cotas_gdf_wgs is not None:
             for idx, row in cotas_gdf_wgs.iterrows():
                 coords = [(pt[1], pt[0]) for pt in row.geometry.coords]
                 dados_cota = row['valor']
                 val = float(dados_cota['val'])
                 is_alert = val < CONFIG['TOLERANCIA_MIN'] or val > CONFIG['TOLERANCIA_MAX']
                 
+                # Se for cota OK e não devemos gerar, pula
+                if not is_alert and not gerar_cotas_ok:
+                    continue
+                # Se for alerta e não devemos gerar, pula
+                if is_alert and not gerar_cotas_alerta:
+                    continue
+
                 # Filtro de Densidade Visual (Python-side)
                 # Se não for alerta, aplica o passo de visualização
                 if not is_alert and (idx % passo != 0):
@@ -602,47 +673,230 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                     icon=folium.DivIcon(
                         icon_size=(150,36),
                         icon_anchor=(75,18),
+                        class_name='cota-marker-container',
                         html=f'<div style="font-size: 10pt; font-weight: bold; color: {text_color}; background: {bg_color}; border: 1px solid {border_color}; border-radius: 4px; text-align: center; width: auto; padding: 2px; display: inline-block;">{val:.2f}m</div>'
                     )
                 ).add_to(target_group)
 
-        # Adiciona os FeatureGroups ao mapa
-        fg_pontos.add_to(m)
-        fg_linhas.add_to(m)
-        fg_cotas_todas.add_to(m)
-        fg_cotas_alertas.add_to(m)
+        # DESENHO DO MAPA DE CALOR
+        if (CONFIG['GERAR_CAMADAS_OCULTAS'] or CONFIG['LAYER_SHOW_HEATMAP']) and heatmap_gdf_wgs is not None:
+            for idx, row in heatmap_gdf_wgs.iterrows():
+                val = row['valor']
+                # Verifica se é alerta
+                is_alert = val < CONFIG['TOLERANCIA_MIN'] or val > CONFIG['TOLERANCIA_MAX']
+                
+                # Define cor
+                color = CONFIG['COTA_COR_ALERTA'] if is_alert else CONFIG['COTA_COR_OK']
+                
+                coords = [(pt[1], pt[0]) for pt in row.geometry.coords]
+                
+                folium.PolyLine(
+                    locations=coords,
+                    color=color,
+                    weight=CONFIG['HEATMAP_ESPESSURA'],
+                    opacity=CONFIG['HEATMAP_OPACIDADE']
+                ).add_to(fg_heatmap)
 
-        # Adiciona a tabela de estatísticas
+        # Adiciona os FeatureGroups ao mapa
+        # LÓGICA DE EXIBIÇÃO: Só adiciona ao mapa se tiver conteúdo E configuração permitir.
+        # Se 'GERAR_CAMADAS_OCULTAS' for True, elas existem mas podem estar invisíveis (show=False).
+        # Se for False, elas nem foram populadas.
+        
+        fg_heatmap.add_to(m)
+        fg_cotas_alertas.add_to(m)
+        
+        # Camadas opcionais (só adiciona se foram geradas/populadas)
+        if CONFIG['GERAR_CAMADAS_OCULTAS'] or CONFIG['LAYER_SHOW_PONTOS']:
+            fg_pontos.add_to(m)
+            
+        if CONFIG['GERAR_CAMADAS_OCULTAS'] or CONFIG['LAYER_SHOW_LINHAS']:
+            fg_linhas.add_to(m)
+            
+        if CONFIG['GERAR_CAMADAS_OCULTAS'] or CONFIG['LAYER_SHOW_COTAS_OK']:
+            fg_cotas_todas.add_to(m)
+
+        # Adiciona a legenda/estatísticas com CSS Responsivo e Controle de Zoom
+        map_id = m.get_name()
+
+        css_style = """
+        <style>
+            /* Remove a atribuição do Leaflet e Google */
+            .leaflet-control-attribution {
+                display: none !important;
+            }
+            
+            /* Oculta cotas em zoom baixo (controlado via JS) */
+            .hide-cota-markers .cota-marker-container {
+                display: none !important;
+            }
+
+            .info-panel {
+                position: fixed;
+                bottom: 30px;
+                left: 50%;
+                transform: translateX(-50%);
+                width: auto;
+                min-width: 250px;
+                max-width: 90vw;
+                z-index: 9999;
+                font-size: 14px;
+                background-color: rgba(255, 255, 255, 0.95);
+                border: 1px solid #ccc;
+                border-radius: 8px;
+                padding: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+                font-family: sans-serif;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+            }
+            .info-panel table {
+                width: 100%;
+                font-size: 13px;
+                margin-bottom: 5px;
+            }
+            .info-panel p {
+                margin: 5px 0 0 0;
+                font-size: 12px;
+                text-align: center;
+            }
+            
+            /* Estilo para o controle de layers quando movido para dentro do painel */
+            .info-panel .leaflet-control-layers {
+                box-shadow: none !important;
+                border: none !important;
+                background: none !important;
+                margin-top: 5px;
+                padding: 0;
+                width: 100%;
+            }
+            
+            .info-panel .leaflet-control-layers-list {
+                margin-bottom: 0;
+            }
+
+            /* Ajustes para Celular (Telas pequenas) */
+            @media (max-width: 600px) {
+                .info-panel {
+                    bottom: 10px;
+                    width: 95vw;
+                    left: 50%;
+                    transform: translateX(-50%);
+                    font-size: 11px;
+                    padding: 8px;
+                }
+                .info-panel table {
+                    font-size: 11px;
+                }
+                .info-panel p {
+                    font-size: 10px;
+                }
+            }
+        </style>
+        """
+        
+        # Script para mover o LayerControl para dentro do InfoPanel
+        js_move_layers = """
+        <script>
+            document.addEventListener("DOMContentLoaded", function() {
+                // Aguarda o carregamento do mapa e controles
+                setTimeout(function() {
+                    var layerControl = document.querySelector('.leaflet-control-layers');
+                    var infoPanel = document.querySelector('.info-panel');
+                    
+                    if (layerControl && infoPanel) {
+                        // Move o controle para dentro do painel
+                        infoPanel.appendChild(layerControl);
+                    }
+                }, 800);
+            });
+        </script>
+        """
+        
+        # Script para controlar visibilidade das cotas baseado no Zoom
+        js_zoom_logic = f"""
+        <script>
+            document.addEventListener("DOMContentLoaded", function() {{
+                // Acessa o objeto mapa pelo ID gerado pelo Folium
+                var map = {map_id};
+                
+                // Define o zoom mínimo para exibir as cotas
+                // Lógica: Exibir apenas nos níveis mais próximos (Zoom In).
+                // Ocultar nos níveis mais distantes (Zoom Out).
+                // Baseado na solicitação: "aparecerem só após o quarto nível de zoom" (contando do mais distante).
+                // Capturamos o zoom inicial (fitBounds) e definimos um offset.
+                
+                // Aguarda um pouco para o fitBounds ocorrer
+                setTimeout(function() {{
+                    var initialZoom = map.getZoom();
+                    // Se o usuário tem ~9 níveis de zoom out, e quer ver após o 4º.
+                    // Significa que os 4 níveis mais baixos (distantes) ficam ocultos.
+                    // Threshold = InitialZoom - 5.
+                    var minVisibleZoom = initialZoom - 5; 
+                    
+                    console.log("Zoom Logic Init: Initial=" + initialZoom + ", MinVisible=" + minVisibleZoom);
+
+                    function updateCotaVisibility() {{
+                        var currentZoom = map.getZoom();
+                        var mapContainer = map.getContainer();
+                        
+                        if (currentZoom < minVisibleZoom) {{
+                            if (!mapContainer.classList.contains('hide-cota-markers')) {{
+                                mapContainer.classList.add('hide-cota-markers');
+                            }}
+                        }} else {{
+                            if (mapContainer.classList.contains('hide-cota-markers')) {{
+                                mapContainer.classList.remove('hide-cota-markers');
+                            }}
+                        }}
+                    }}
+                    
+                    map.on('zoomend', updateCotaVisibility);
+                    
+                    // Executa verificação inicial
+                    updateCotaVisibility();
+                }}, 1000);
+            }});
+        </script>
+        """
+        
+        m.get_root().html.add_child(folium.Element(css_style))
+        m.get_root().html.add_child(folium.Element(js_move_layers))
+        m.get_root().html.add_child(folium.Element(js_zoom_logic))
+
         legend_html = f'''
-         <div style="position: fixed; 
-         bottom: 50px; left: 50px; width: 320px; height: auto; 
-         z-index:9999; font-size:14px;
-         background-color: white;
-         border: 2px solid grey;
-         padding: 10px;
-         opacity: 0.95;
-         box-shadow: 0 0 10px rgba(0,0,0,0.2);">
-         
-         {stats_html}
-         <p><small><i>Densidade Visual: 1 a cada {passo} cotas (OK).</i></small></p>
-         </div>
-         '''
+        <div class="info-panel">
+            {stats_html}
+        </div>
+        '''
+        
         m.get_root().html.add_child(folium.Element(legend_html))
         
         # Controles finais
-        folium.LayerControl().add_to(m)
+        # Adiciona LayerControl expandido. A posição inicial não importa muito pois o JS vai mover,
+        # mas 'bottomright' evita sobreposição inicial.
+        folium.LayerControl(collapsed=False, position='bottomright').add_to(m)
+        
         Fullscreen().add_to(m)
 
-        # Salva o arquivo específico
-        nome_arquivo = f'mapa_projeto_densidade_{passo}.html'
+        # Calcula data de ontem
+        ontem = datetime.now() - timedelta(days=1)
+        data_str = ontem.strftime('%d-%m-%Y') # Usando hifens para ser válido no sistema de arquivos
+        
+        # Nome base com a data
+        nome_base = f"Mapa Espaçamento Plantio - {data_str}"
+
+        # Salva o arquivo específico (com sufixo de densidade para diferenciação técnica)
+        nome_arquivo = f'{nome_base} - densidade_{passo}.html'
         output_file = os.path.join(pasta_saida_mapas, nome_arquivo)
         m.save(output_file)
         print(f"Mapa salvo com sucesso em: {output_file}")
         
-        # Se for o passo 1 (padrão), salva também como mapa_projeto.html para facilitar
+        # Se for o passo 1 (padrão), salva com o nome principal solicitado pelo usuário
         if passo == 1:
-             output_file_default = os.path.join(pasta_saida_mapas, 'mapa_projeto.html')
+             output_file_default = os.path.join(pasta_saida_mapas, f'{nome_base}.html')
              m.save(output_file_default)
+             print(f"Mapa principal salvo em: {output_file_default}")
 
     print("Todos os mapas foram gerados com sucesso.")
 
