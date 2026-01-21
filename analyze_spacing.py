@@ -504,9 +504,21 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
         
         for idx, row in cotas_gdf_wgs.iterrows():
             coords = [[pt[1], pt[0]] for pt in row.geometry.coords] # [[lat, lon], [lat, lon]]
+            # O valor no GeoDataFrame agora é um dicionário (devido à nossa mudança anterior), 
+            # mas o GeoPandas pode ter bagunçado se tentou salvar dict em coluna.
+            # Vamos verificar como 'cotas_valores' foi construído.
+            
+            # Na verdade, cotas_valores era uma lista de dicts: [{'val':..., 'pos':..., 'len':...}]
+            # Quando criamos o GeoDataFrame: gpd.GeoDataFrame({'valor': cotas_valores, ...})
+            # A coluna 'valor' contém os dicionários inteiros!
+            
+            dados_cota = row['valor']
+            
             cotas_json_data.append({
                 "coords": coords,
-                "val": round(row['valor'], 2)
+                "val": round(dados_cota['val'], 2),
+                "pos": round(dados_cota['pos'], 2),
+                "len": round(dados_cota['len'], 2)
             })
 
     # Adiciona os FeatureGroups estáticos ao mapa
