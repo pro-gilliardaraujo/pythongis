@@ -9,6 +9,7 @@ import glob
 import zipfile
 import folium
 from folium.plugins import MeasureControl, Fullscreen
+import branca.colormap as cm
 from datetime import datetime, timedelta
 
 # ==============================================================================
@@ -48,29 +49,36 @@ CONFIG = {
     'LISTA_PASSOS_VISUALIZACAO': [10], # Gera mapas para cada passo (1 = Todas as cotas)
     'COTA_COR_OK': '#00FF00', # Verde
     'COTA_COR_ALERTA': '#FF0000', # Vermelho
-    'COTA_ESPESSURA': 2,
+    'COTA_ESPESSURA': 1,
     
     # Estilo Mapa de Calor
-    'HEATMAP_ESPESSURA': 7, # Linha grossa
+    'HEATMAP_ESPESSURA': 5, # Linha grossa
     'HEATMAP_OPACIDADE': 0.7,
     
     # Parâmetros de Tolerância (O que é aceitável?)
     'TOLERANCIA_MIN': 2.9, # Abaixo disso é alerta
     'TOLERANCIA_MAX': 3.1, # Acima disso é alerta
-    'FATOR_CORTE_VISUALIZACAO': 2.0, # Multiplicador sobre a TOLERANCIA_MAX. Se dist > (MAX * 2), a cota é descartada (gap entre talhões).
+    'FATOR_CORTE_VISUALIZACAO': 1.5, # Multiplicador sobre a TOLERANCIA_MAX. Se dist > (MAX * 2), a cota é descartada (gap entre talhões).
     
     # Parâmetros de Geração de Linha
     'QUEBRA_TEMPO_SEC': 60,
     'QUEBRA_ANGULO_GRAUS': 60,
+    'MIN_MOVIMENTO_DIRECAO': 2.0,
     
     # Parâmetros de Cálculo de Espaçamento
     # NOTA: O filtro de amostragem e offset é feito no Python.
-    'OFFSET_CABECEIRA_METROS': 10.0,
-    'AMOSTRAGEM_DIST_METROS': 5.0,
-    'MIN_DIST_ENTRE_COTAS_MESMA_LINHA': 3.0, # Distância mínima entre cotas na mesma linha (limpeza visual)
-    'FILTRO_DIST_MIN': 1.35, # Aumentado para ignorar sobreposições e segmentos colineares muito próximos
-    'FILTRO_DIST_MAX': 15.0, # Reduzido para evitar conectar com linhas muito distantes (ex: 24m)
+    'OFFSET_CABECEIRA_METROS': 0.0, # Zerado para não perder dados em segmentos curtos
+    'AMOSTRAGEM_DIST_METROS': 5.0, #estava em 5
+    'MIN_DIST_ENTRE_COTAS_MESMA_LINHA': 10.0, # Original estava em 3 . Distância mínima entre cotas na mesma linha (limpeza visual)
+    'FILTRO_DIST_MIN': 2, # Aumentado para ignorar sobreposições e segmentos colineares muito próximos
+    'FILTRO_DIST_MAX': 50.0, # Aumentado para garantir busca mesmo em ruas distantes
     'MIN_DIST_TOPOLOGICA': 50.0, # Distância mínima AO LONGO DA LINHA para considerar como vizinho (evita auto-interseção local)
+    'DISTANCIA_CLUSTER': 50.0, # Distância para agrupar linhas em "Clusters" (Áreas de Interesse)
+    'MIN_CLUSTER_LENGTH_TOTAL': 1000.0, # Mínimo de metros totais de linha para considerar um Cluster válido (ignora manobras isoladas)
+    'MIN_COMPRIMENTO_TIRO_STATS': 50.0, # Mínimo de metros para considerar uma linha no cálculo de "Tiro Médio"
+    'DISTANCIA_MAX_EMENDA': 50.0, # Distância máxima entre fim de uma linha e início da próxima para unir (corrige fragmentação)
+    'DISTANCIA_MAX_EMENDA_LONGA': 1600.0,
+    'ANGULO_MAX_EMENDA': 45.0, # Ângulo máximo de desvio para unir segmentos (evita unir linhas paralelas/manobras)
 }
 
 def calcular_utm_epsg(lat, lon):
@@ -155,13 +163,12 @@ def gerar_segmentos_por_tempo_direcao(gdf_pontos_utm, coluna_tempo='Time'):
     pontos = pontos.dropna(subset=[coluna_tempo])
     pontos = pontos.sort_values(coluna_tempo).reset_index(drop=True)
     
-    if len(pontos) < 3:
+    if len(pontos) < 2:
         return []
     
     segmentos = []
-    segmento_atual = []
+    segmento_atual = [pontos['orig_index'].iloc[0]]
     
-    tempo_anterior = None
     angulo_anterior = None
     
     for i in range(1, len(pontos)):
@@ -172,31 +179,245 @@ def gerar_segmentos_por_tempo_direcao(gdf_pontos_utm, coluna_tempo='Time'):
         
         dx = p2.x - p1.x
         dy = p2.y - p1.y
+        dist_move = math.hypot(dx, dy)
         angulo = (math.degrees(math.atan2(dy, dx)) + 360) % 360
         
-        if tempo_anterior is None:
-            tempo_anterior = dt
+        quebra = False
         
-        if angulo_anterior is None:
-            angulo_anterior = angulo
+        if dt > CONFIG['QUEBRA_TEMPO_SEC']:
+            quebra = True
+        elif dist_move >= CONFIG['MIN_MOVIMENTO_DIRECAO'] and angulo_anterior is not None:
+            variacao_angulo = abs(angulo - angulo_anterior)
+            variacao_angulo = min(variacao_angulo, 360 - variacao_angulo)
+            if variacao_angulo > CONFIG['QUEBRA_ANGULO_GRAUS']:
+                quebra = True
         
-        variacao_angulo = abs(angulo - angulo_anterior)
-        variacao_angulo = min(variacao_angulo, 360 - variacao_angulo)
-        
-        if dt > CONFIG['QUEBRA_TEMPO_SEC'] or variacao_angulo > CONFIG['QUEBRA_ANGULO_GRAUS']:
-            if len(segmento_atual) >= 3:
+        if quebra:
+            if len(segmento_atual) >= 2:
                 segmentos.append(segmento_atual)
-            segmento_atual = []
+            segmento_atual = [pontos['orig_index'].iloc[i]]
+            angulo_anterior = angulo if dist_move >= CONFIG['MIN_MOVIMENTO_DIRECAO'] else None
+            continue
         
         segmento_atual.append(pontos['orig_index'].iloc[i])
         
-        tempo_anterior = dt
-        angulo_anterior = angulo
+        if dist_move >= CONFIG['MIN_MOVIMENTO_DIRECAO']:
+            angulo_anterior = angulo
     
-    if len(segmento_atual) >= 3:
+    if len(segmento_atual) >= 2:
         segmentos.append(segmento_atual)
     
-    return segmentos
+    # Adiciona metadados temporais ao segmento
+    # Retorna lista de tuplas: (indices, timestamp_inicio)
+    segmentos_com_tempo = []
+    for seg in segmentos:
+        # Pega o timestamp do primeiro ponto do segmento
+        primeiro_idx = seg[0]
+        # Como 'seg' são indices originais, precisamos achar no 'pontos' filtrado
+        # O dataframe 'pontos' tem a coluna 'orig_index'.
+        # Vamos achar a linha correspondente
+        row = pontos[pontos['orig_index'] == primeiro_idx].iloc[0]
+        timestamp = row[coluna_tempo]
+        segmentos_com_tempo.append({'indices': seg, 'time': timestamp})
+
+    return segmentos_com_tempo
+
+def calcular_clusters_espaciais(linhas_gdf, distancia_buffer=30):
+    """
+    Agrupa linhas em clusters espaciais baseados na proximidade.
+    
+    Args:
+        linhas_gdf (GeoDataFrame): GeoDataFrame contendo as linhas (LineString) e coluna 'time'.
+        distancia_buffer (float): Distância em metros para expandir as linhas e verificar sobreposição.
+        
+    Returns:
+        GeoDataFrame: Clusters (Polígonos) com ID e Tempo Médio/Mínimo.
+        GeoDataFrame: Linhas originais com coluna 'cluster_id' adicionada.
+    """
+    from shapely.ops import unary_union
+    
+    # 1. Cria buffers ao redor das linhas
+    buffers = linhas_gdf.geometry.buffer(distancia_buffer)
+    
+    # 2. Une todos os buffers para formar "manchas" contínuas
+    merged_poly = unary_union(buffers)
+    
+    # 3. Separa as manchas em polígonos individuais
+    clusters_polys = []
+    if merged_poly.geom_type == 'MultiPolygon':
+        clusters_polys = list(merged_poly.geoms)
+    elif merged_poly.geom_type == 'Polygon':
+        clusters_polys = [merged_poly]
+        
+    # 4. Cria GDF dos clusters
+    clusters_gdf = gpd.GeoDataFrame(geometry=clusters_polys, crs=linhas_gdf.crs)
+    clusters_gdf['cluster_id'] = range(len(clusters_gdf))
+    
+    # 5. Associa cada linha ao seu cluster (Spatial Join)
+    # Usa predicate='intersects' ou 'within'
+    linhas_com_cluster = gpd.sjoin(linhas_gdf, clusters_gdf, how='left', predicate='intersects')
+    
+    # --- FILTRAGEM DE CLUSTERS INVÁLIDOS ---
+    # Calcula comprimento total de linhas por cluster para remover ruídos/manobras isoladas
+    # Primeiro calcula o comprimento de cada linha
+    linhas_com_cluster['temp_len'] = linhas_com_cluster.geometry.length
+    cluster_stats = linhas_com_cluster.groupby('cluster_id')['temp_len'].sum().reset_index(name='total_length')
+    # Remove coluna temporária
+    linhas_com_cluster = linhas_com_cluster.drop(columns=['temp_len'])
+    
+    # Filtra IDs válidos
+    valid_cluster_ids = cluster_stats[cluster_stats['total_length'] >= CONFIG['MIN_CLUSTER_LENGTH_TOTAL']]['cluster_id']
+    
+    # Mantém apenas clusters válidos no GDF de Clusters
+    clusters_gdf = clusters_gdf[clusters_gdf['cluster_id'].isin(valid_cluster_ids)].copy()
+    
+    if clusters_gdf.empty:
+        linhas_com_cluster['cluster_label'] = None
+        return clusters_gdf, linhas_com_cluster
+
+    # 6. Calcula metadados do cluster (Data/Hora para ordenação)
+    # Usa apenas linhas de clusters válidos para calcular o tempo mínimo
+    cluster_meta = linhas_com_cluster[linhas_com_cluster['cluster_id'].isin(valid_cluster_ids)].groupby('cluster_id')['time'].min().reset_index()
+    clusters_gdf = clusters_gdf.merge(cluster_meta, on='cluster_id')
+    
+    # Ordena clusters por tempo (mais recente ou mais antigo?)
+    # O usuário pediu "ordem decrescente de horario" (A = mais recente, ou A = primeiro?)
+    # Geralmente A, B, C é cronológico. Vamos assumir Ordem CRESCENTE (A = Início).
+    # Se quiser decrescente: ascending=False
+    clusters_gdf = clusters_gdf.sort_values('time', ascending=True).reset_index(drop=True)
+    
+    # Reatribui IDs baseados na ordem temporal (0 -> A, 1 -> B...)
+    # Mapeamento old_id -> new_label
+    clusters_gdf['novo_id'] = range(len(clusters_gdf))
+    # Gera labels A, B, C... Z, AA, AB... (embora improvável ter tantos)
+    def generate_label(n):
+        if n < 26:
+            return chr(65 + n)
+        else:
+            return f"{chr(65 + (n // 26) - 1)}{chr(65 + (n % 26))}"
+            
+    clusters_gdf['label'] = clusters_gdf['novo_id'].apply(generate_label) 
+    
+    # Atualiza nas linhas
+    id_map = dict(zip(clusters_gdf['cluster_id'], clusters_gdf['label']))
+    linhas_com_cluster['cluster_label'] = linhas_com_cluster['cluster_id'].map(id_map)
+    
+    return clusters_gdf, linhas_com_cluster
+
+def unir_linhas_fragmentadas(linhas_gdf, dist_max=50.0, angulo_max=45.0):
+    """
+    Une segmentos de linha que são consecutivos no tempo e próximos espacialmente.
+    Usa critérios de distância E ângulo para evitar unir passadas paralelas.
+    """
+    if linhas_gdf.empty or 'cluster_label' not in linhas_gdf.columns:
+        return linhas_gdf
+
+    novas_linhas = []
+    
+    # Processa cada cluster separadamente
+    for label in linhas_gdf['cluster_label'].unique():
+        if pd.isna(label): continue
+        
+        grupo = linhas_gdf[linhas_gdf['cluster_label'] == label].copy()
+        
+        # Ordena por tempo para tentar unir na sequência correta
+        if 'time' in grupo.columns:
+            grupo = grupo.sort_values('time')
+        
+        linhas_do_grupo = list(grupo.itertuples(index=False))
+        if not linhas_do_grupo: continue
+        
+        # Algoritmo de união sequencial
+        linha_atual_geom = linhas_do_grupo[0].geometry
+        linha_atual_meta = linhas_do_grupo[0]._asdict() # Preserva metadados
+        
+        for i in range(1, len(linhas_do_grupo)):
+            prox_geom = linhas_do_grupo[i].geometry
+            prox_meta = linhas_do_grupo[i]._asdict()
+            
+            # Pega o último ponto da linha atual e o primeiro da próxima
+            # Verifica se as geometrias têm pontos suficientes
+            if len(linha_atual_geom.coords) < 2 or len(prox_geom.coords) < 2:
+                 # Se for ponto ou linha muito curta sem vetor, só checa distância
+                 p_fim = Point(linha_atual_geom.coords[-1])
+                 p_inicio = Point(prox_geom.coords[0])
+                 if p_fim.distance(p_inicio) <= dist_max:
+                      # Une
+                      coords_nova = list(linha_atual_geom.coords) + list(prox_geom.coords)
+                      linha_atual_geom = LineString(coords_nova)
+                 else:
+                      # Salva e reseta
+                      linha_salvar = linha_atual_meta.copy()
+                      linha_salvar['geometry'] = linha_atual_geom
+                      novas_linhas.append(linha_salvar)
+                      linha_atual_geom = prox_geom
+                      linha_atual_meta = prox_meta
+                 continue
+
+            # --- ANÁLISE VETORIAL ROBUSTA (Global) ---
+            # Usa o vetor global da linha (Início -> Fim) para evitar ruído de GPS nos últimos pontos
+            p_start_line = linha_atual_geom.coords[0]
+            p_end_line = linha_atual_geom.coords[-1]
+            
+            dx_line = p_end_line[0] - p_start_line[0]
+            dy_line = p_end_line[1] - p_start_line[1]
+
+            p_next_start = prox_geom.coords[0]
+            dx_gap = p_next_start[0] - p_end_line[0]
+            dy_gap = p_next_start[1] - p_end_line[1]
+            dist_gap = math.hypot(dx_gap, dy_gap)
+            
+            # Se a linha for muito curta (ponto?), não tem vetor confiável
+            if math.hypot(dx_line, dy_line) < 1.0:
+                 # Usa lógica de distância simples
+                 if dist_gap <= dist_max:
+                      coords_nova = list(linha_atual_geom.coords) + list(prox_geom.coords)
+                      linha_atual_geom = LineString(coords_nova)
+                 else:
+                      linha_salvar = linha_atual_meta.copy()
+                      linha_salvar['geometry'] = linha_atual_geom
+                      novas_linhas.append(linha_salvar)
+                      linha_atual_geom = prox_geom
+                      linha_atual_meta = prox_meta
+                 continue
+
+            angulo_line = math.degrees(math.atan2(dy_line, dx_line))
+            
+            # Vetor do Gap (Fim Atual -> Início Próxima)
+            angulo_gap = math.degrees(math.atan2(dy_gap, dx_gap))
+            
+            # Diferença angular
+            diff_angulo = abs(angulo_line - angulo_gap)
+            diff_angulo = min(diff_angulo, 360 - diff_angulo)
+            
+            dist_max_longa = CONFIG.get('DISTANCIA_MAX_EMENDA_LONGA', dist_max)
+            dist_limite = dist_max_longa if diff_angulo <= 15.0 else dist_max
+
+            if dist_gap <= dist_limite and diff_angulo <= angulo_max:
+                # UNE AS LINHAS
+                coords_nova = list(linha_atual_geom.coords) + list(prox_geom.coords)
+                linha_atual_geom = LineString(coords_nova)
+            else:
+                # FINALIZA A LINHA ATUAL E COMEÇA OUTRA
+                linha_salvar = linha_atual_meta.copy()
+                linha_salvar['geometry'] = linha_atual_geom
+                novas_linhas.append(linha_salvar)
+                
+                # Inicia nova
+                linha_atual_geom = prox_geom
+                linha_atual_meta = prox_meta
+        
+        # Adiciona a última
+        linha_salvar = linha_atual_meta.copy()
+        linha_salvar['geometry'] = linha_atual_geom
+        novas_linhas.append(linha_salvar)
+            
+    if not novas_linhas:
+        return linhas_gdf
+        
+    # Recria o GeoDataFrame
+    gdf_unido = gpd.GeoDataFrame(novas_linhas, crs=linhas_gdf.crs)
+    return gdf_unido
 
 def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
     """
@@ -275,6 +496,7 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
     
     linhas_geradas = []
     linhas_geradas_wgs = []
+    linhas_meta_data = [] # Lista de dicionários com 'time'
     
     if not pontos.empty:
         print("\n--- Iniciando Análise de Espaçamento ---")
@@ -288,21 +510,24 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                 print("Nenhum ponto com 'AppliedRate > 0' encontrado. Usando todos os pontos.")
 
         print("Tentando gerar linhas a partir dos pontos (por tempo e direção)...")
-        segmentos = gerar_segmentos_por_tempo_direcao(pontos)
-        print(f"Segmentos gerados: {len(segmentos)}")
+        # Agora retorna lista de dicts: {'indices': [...], 'time': timestamp}
+        segmentos_info = gerar_segmentos_por_tempo_direcao(pontos)
+        print(f"Segmentos gerados: {len(segmentos_info)}")
         
-        if len(segmentos) > 0:
+        if len(segmentos_info) > 0:
             pontos_utm_index = pontos.set_index('orig_index')
             pontos_wgs = gdf.loc[pontos_utm_index.index].copy()
             pontos_wgs['orig_index'] = pontos_wgs.index
             pontos_wgs = pontos_wgs.set_index('orig_index')
             
-            for seg in segmentos:
+            for seg_info in segmentos_info:
+                seg_indices = seg_info['indices']
                 try:
-                    linha_utm = LineString(pontos_utm_index.loc[seg].geometry.tolist())
-                    linha_wgs = LineString(pontos_wgs.loc[seg].geometry.tolist())
+                    linha_utm = LineString(pontos_utm_index.loc[seg_indices].geometry.tolist())
+                    linha_wgs = LineString(pontos_wgs.loc[seg_indices].geometry.tolist())
                     linhas_geradas.append(linha_utm)
                     linhas_geradas_wgs.append(linha_wgs)
+                    linhas_meta_data.append({'time': seg_info['time']})
                 except:
                     continue
         
@@ -316,7 +541,31 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
         
         if len(linhas_geradas) > 1:
             print("Calculando distâncias LATERAIS (Swath) entre linhas geradas...")
-            linhas_gdf = gpd.GeoDataFrame(geometry=linhas_geradas, crs=gdf_utm.crs)
+            # Cria GDF com geometria e metadata (Time)
+            linhas_gdf = gpd.GeoDataFrame(
+                linhas_meta_data, 
+                geometry=linhas_geradas, 
+                crs=gdf_utm.crs
+            )
+            sindex = linhas_gdf.sindex
+            
+            # --- CLUSTERING ESPACIAL ---
+            print("Agrupando linhas em Clusters (Áreas de Interesse)...")
+            clusters_gdf, linhas_gdf_clustered = calcular_clusters_espaciais(linhas_gdf, CONFIG['DISTANCIA_CLUSTER'])
+            print(f"Clusters encontrados: {len(clusters_gdf)}")
+            
+            # Atualiza sindex e linhas_gdf para usar o clustered (que tem labels)
+            linhas_gdf = linhas_gdf_clustered
+            sindex = linhas_gdf.sindex
+
+            # --- CORREÇÃO DE FRAGMENTAÇÃO (NOVO) ---
+            print("Unindo segmentos fragmentados para corrigir cálculo de Tiro Médio...")
+            linhas_gdf = unir_linhas_fragmentadas(
+                linhas_gdf, 
+                dist_max=CONFIG['DISTANCIA_MAX_EMENDA'],
+                angulo_max=CONFIG['ANGULO_MAX_EMENDA']
+            )
+            # Reconstroi o índice espacial após a união
             sindex = linhas_gdf.sindex
             
             # Para cada linha, amostramos pontos e medimos distância para a linha vizinha
@@ -488,18 +737,55 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
             print(f"Mediana Estimada (Robusta): {mediana:.2f} m")
             print(f"Mínimo Absoluto: {minimo:.2f} m")
             
-            # CÁLCULO DO TIRO MÉDIO
+            # CÁLCULO DO TIRO MÉDIO (FILTRADO)
             # O 'tiro' é o comprimento de cada segmento contínuo (linha gerada)
-            comprimentos_tiros = [linha.length for linha in linhas_geradas]
+            # Filtra linhas muito curtas (manobras/picotes) para não distorcer a média
+            if 'linhas_gdf' in locals() and not linhas_gdf.empty:
+                comprimentos_tiros = [linha.length for linha in linhas_gdf.geometry if linha.length >= CONFIG['MIN_COMPRIMENTO_TIRO_STATS']]
+            else:
+                comprimentos_tiros = [linha.length for linha in linhas_geradas if linha.length >= CONFIG['MIN_COMPRIMENTO_TIRO_STATS']]
+            
+            # Se não sobrar nada (tudo picote?), usa tudo
+            if not comprimentos_tiros:
+                if 'linhas_gdf' in locals() and not linhas_gdf.empty:
+                    comprimentos_tiros = [linha.length for linha in linhas_gdf.geometry]
+                else:
+                    comprimentos_tiros = [linha.length for linha in linhas_geradas]
+                
             tiro_medio = np.mean(comprimentos_tiros) if comprimentos_tiros else 0
             
+            # CÁLCULO POR CLUSTER
+            stats_cluster_html = ""
+            if 'cluster_label' in linhas_gdf.columns:
+                 # Agrupa stats por cluster
+                 # Remove título e simplifica tabela
+                 stats_cluster_html += "<table border='1' style='border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 5px; border-top: none;'>"
+                 stats_cluster_html += "<tr><th>Área</th><th>Tiro Médio*</th></tr>"
+                 
+                 for label in sorted(linhas_gdf['cluster_label'].dropna().unique()):
+                     grupo = linhas_gdf[linhas_gdf['cluster_label'] == label]
+                     
+                     # Filtra tiros curtos para a média do cluster
+                     tiros_validos = grupo[grupo.geometry.length >= CONFIG['MIN_COMPRIMENTO_TIRO_STATS']]
+                     if tiros_validos.empty:
+                         tiros_validos = grupo
+                         
+                     tiro_medio_cluster = tiros_validos.geometry.length.mean()
+                     
+                     stats_cluster_html += f"<tr><td style='text-align:center;'><b>{label}</b></td><td style='text-align:left;'>{tiro_medio_cluster:.1f}m</td></tr>"
+                 
+                 stats_cluster_html += "</table>"
+
             # Adiciona ao HTML (SIMPLIFICADO)
             stats_html += f"""
             <table border="1" style="border-collapse: collapse; width: 100%;">
                 <tr><td><b>Espaçamento médio</b></td><td>{media:.2f} m</td></tr>
-                <tr><td><b>Tiro médio</b></td><td>{tiro_medio:.2f} m</td></tr>
+                <tr><td><b>Tiro médio (Geral)</b></td><td>{tiro_medio:.2f} m</td></tr>
             </table>
             """
+            
+            # Adiciona tabela de clusters se houver (sem BR antes)
+            stats_html += stats_cluster_html
         else:
             print("Não foi possível determinar o espaçamento entre linhas (talvez seja passe único).")
             stats_html += "<p>Não foi possível calcular espaçamento entre linhas (possível passe único ou dados esparsos).</p>"
@@ -548,6 +834,17 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
             crs=gdf_utm.crs
         )
         heatmap_gdf_wgs = heatmap_gdf_utm.to_crs(epsg=4326)
+        
+    # Prepara Clusters em WGS84 para Labels
+    clusters_wgs_json = None
+    if clusters_gdf is not None:
+        clusters_gdf_wgs = clusters_gdf.to_crs(epsg=4326)
+        
+        # Converte Timestamp para String antes de serializar JSON
+        if 'time' in clusters_gdf_wgs.columns:
+            clusters_gdf_wgs['time'] = clusters_gdf_wgs['time'].astype(str)
+            
+        clusters_wgs_json = clusters_gdf_wgs.to_json()
 
     # Garante que a pasta de saída existe
     os.makedirs(pasta_saida_mapas, exist_ok=True)
@@ -686,7 +983,7 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                 
                 # Adiciona o rótulo
                 text_color = 'white' if is_alert else 'black'
-                bg_color = 'red' if is_alert else 'rgba(255,255,255,0.7)'
+                bg_color = CONFIG['COTA_COR_ALERTA'] if is_alert else 'rgba(255,255,255,0.7)'
                 border_color = color
                 
                 folium.map.Marker(
@@ -814,6 +1111,26 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                 margin-bottom: 0;
             }
 
+            /* Ícone de Trena (Régua) para o Measure Control */
+            .leaflet-control-measure-toggle {
+                background-image: none !important;
+                display: flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                color: #444;
+            }
+            .leaflet-control-measure-toggle::after {
+                content: "📏"; /* Emoji de régua como ícone universal */
+                font-size: 22px;
+            }
+            /* Ajuste do popup de medição para não ficar quebrado */
+            .leaflet-control-measure-interaction {
+                background-color: white;
+                padding: 10px;
+                border-radius: 5px;
+                box-shadow: 0 1px 5px rgba(0,0,0,0.4);
+            }
+
             /* Ajustes para Celular (Telas pequenas) */
             @media (max-width: 600px) {
                 .info-panel {
@@ -860,52 +1177,25 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                 var map = {map_id};
                 
                 // Define o zoom mínimo para exibir as cotas
-                // Lógica de Amostragem por Nível de Zoom
-                
+                // SOLICITAÇÃO: Aparecer somente quando zoom >= 19
+                var minVisibleZoom = 19;
+
                 // Aguarda um pouco para o fitBounds ocorrer
                 setTimeout(function() {{
                     var initialZoom = map.getZoom();
                     
-                    // Definição de Limiares (Thresholds) relativos ao zoom inicial
-                    // Zoom Baixo (Longe): Mostra apenas lvl 1 (1/20)
-                    // Zoom Médio: Mostra lvl 1 + lvl 2 (1/5)
-                    // Zoom Alto (Perto): Mostra tudo (1/1)
-                    
-                    // Exemplo: Se Initial = 18.
-                    // < 15: Esconde tudo (Opcional, ou mostra só lvl 1)
-                    // 15 - 16: Lvl 1
-                    // 17: Lvl 1 + 2
-                    // >= 18: Tudo
-                    
-                    var zoomThresholdLow = initialZoom - 4; // Abaixo disso, esconde tudo ou mostra muito pouco
-                    var zoomThresholdMid = initialZoom - 2; // Começa a mostrar médio
-                    var zoomThresholdHigh = initialZoom;    // Mostra tudo
-                    
-                    console.log("Zoom Logic Init: Initial=" + initialZoom);
+                    console.log("Zoom Logic Init: Initial=" + initialZoom + ", MinVisible=" + minVisibleZoom);
 
                     function updateCotaVisibility() {{
                         var currentZoom = map.getZoom();
                         var mapContainer = map.getContainer();
-                        var classList = mapContainer.classList;
                         
-                        // Limpa estados
-                        classList.remove('hide-all-cotas');
-                        classList.remove('show-lvl-2');
-                        classList.remove('show-lvl-3');
-                        
-                        if (currentZoom < zoomThresholdLow) {{
-                            // Zoom muito longe: Esconde tudo para limpar a visão
-                            classList.add('hide-all-cotas');
-                        }} else if (currentZoom < zoomThresholdMid) {{
-                            // Zoom baixo: Mostra apenas Lvl 1 (padrão CSS, sem classes extras)
-                            // Nenhuma ação necessária, pois lvl 2 e 3 estão hidden por CSS padrão
-                        }} else if (currentZoom < zoomThresholdHigh) {{
-                            // Zoom médio: Mostra Lvl 1 + Lvl 2
-                            classList.add('show-lvl-2');
+                        if (currentZoom < minVisibleZoom) {{
+                            mapContainer.classList.add('hide-all-cotas');
                         }} else {{
-                            // Zoom alto: Mostra Tudo
-                            classList.add('show-lvl-2');
-                            classList.add('show-lvl-3');
+                            mapContainer.classList.remove('hide-all-cotas');
+                            mapContainer.classList.add('show-lvl-2');
+                            mapContainer.classList.add('show-lvl-3');
                         }}
                     }}
                     
@@ -944,13 +1234,6 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
         legend_html = f'''
         <div class="info-panel">
             {stats_html}
-            <div style="margin-top: 10px; font-size: 0.9em; color: #555;">
-               <hr>
-               <b>Legenda de Zoom:</b><br>
-               Zoom Baixo: Oculta Cotas<br>
-               Zoom Médio: Mostra Algumas<br>
-               Zoom Alto: Mostra Todas
-            </div>
         </div>
         '''
         
@@ -959,6 +1242,68 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
         m.get_root().html.add_child(folium.Element(js_zoom_logic))
         
         m.get_root().html.add_child(folium.Element(legend_html))
+
+        # CSS para personalizar o ícone do MeasureControl (Régua)
+        css_measure_icon = """
+        <style>
+            .leaflet-control-measure-toggle {
+                background-image: none !important;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 20px;
+                color: #000;
+            }
+            .leaflet-control-measure-toggle::after {
+                content: '📏';
+            }
+        </style>
+        """
+        m.get_root().html.add_child(folium.Element(css_measure_icon))
+
+        # JS/CSS para personalizar o LayerControl (2 colunas e ocultar checkbox do Heatmap)
+        js_layer_control_hack = """
+        <script>
+            // Executa após o carregamento para garantir que o LayerControl já existe
+            window.addEventListener('load', function() {
+                setTimeout(function() {
+                    // 1. Ocultar checkbox do Mapa de Tendência
+                    // Procura labels dentro do controle de camadas
+                    var labels = document.querySelectorAll('.leaflet-control-layers-overlays label');
+                    labels.forEach(function(label) {
+                        // Verifica o texto dentro do span
+                        var span = label.querySelector('span');
+                        if (span && span.textContent.includes('Mapa de Tendência')) {
+                            label.style.display = 'none';
+                        }
+                    });
+
+                    // 2. Ajustar layout para 2 colunas
+                    var overlaysContainer = document.querySelector('.leaflet-control-layers-overlays');
+                    if (overlaysContainer) {
+                        overlaysContainer.style.display = 'flex';
+                        overlaysContainer.style.flexWrap = 'wrap';
+                        overlaysContainer.style.width = '320px'; // Largura fixa para acomodar 2 colunas
+                    }
+                    
+                    // Aplica estilo aos itens (labels) para ocuparem 50%
+                    labels.forEach(function(label) {
+                        label.style.width = '50%';
+                        label.style.boxSizing = 'border-box';
+                        label.style.marginBottom = '5px';
+                    });
+                    
+                    // Ajuste do container principal para não ficar muito estreito
+                    var controlForm = document.querySelector('.leaflet-control-layers-list');
+                    if (controlForm) {
+                        controlForm.style.minWidth = '320px';
+                    }
+                    
+                }, 1000); // Delay de 1s para garantir renderização do Leaflet
+            });
+        </script>
+        """
+        m.get_root().html.add_child(folium.Element(js_layer_control_hack))
         
         # Controles finais
         # Adiciona LayerControl expandido. A posição inicial não importa muito pois o JS vai mover,
@@ -966,6 +1311,43 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
         folium.LayerControl(collapsed=False, position='bottomright').add_to(m)
         
         Fullscreen().add_to(m)
+
+        MeasureControl(
+            position='topright', 
+            primary_length_unit='meters', 
+            secondary_length_unit='kilometers',
+            primary_area_unit='sqmeters', 
+            secondary_area_unit='hectares',
+            active_color='#00FF00', 
+            completed_color='#0000FF',
+            localization={
+                'measure': 'Medir',
+                'measureDistancesAndAreas': 'Medir distâncias e áreas',
+                'createNewMeasurement': 'Nova Medição',
+                'startCreating': 'Clique para começar a medir',
+                'finishMeasurement': 'Concluir Medição',
+                'lastPoint': 'Último ponto',
+                'area': 'Área',
+                'perimeter': 'Perímetro',
+                'pointLocation': 'Localização',
+                'length': 'Comprimento',
+                'cancel': 'Cancelar'
+            }
+        ).add_to(m)
+        
+        # --- LABELS DE CLUSTERS (ÁREAS) ---
+        if 'clusters_gdf' in locals() and clusters_gdf is not None and not clusters_gdf.empty:
+            # Usa clusters_gdf_wgs calculado anteriormente
+            if 'clusters_gdf_wgs' in locals() and clusters_gdf_wgs is not None:
+                 for idx, row in clusters_gdf_wgs.iterrows():
+                     label = row['label']
+                     centroide = row.geometry.centroid
+                     folium.Marker(
+                         location=[centroide.y, centroide.x],
+                         icon=folium.DivIcon(
+                             html=f"<div style='font-size: 24px; font-weight: bold; color: white; text-shadow: 2px 2px 4px #000;'>{label}</div>"
+                         )
+                     ).add_to(m)
 
         # Calcula data de ontem
         ontem = datetime.now() - timedelta(days=1)
