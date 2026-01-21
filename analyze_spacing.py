@@ -46,10 +46,12 @@ CONFIG = {
     'QUEBRA_ANGULO_GRAUS': 60,
     
     # Parâmetros de Cálculo de Espaçamento
-    'OFFSET_CABECEIRA_METROS': 20.0, # Ignorar os primeiros/últimos X metros da linha (Manobras)
-    'AMOSTRAGEM_DIST_METROS': 10.0, # Aumentei para 10m para gerar menos cotas e poluir menos
-    'FILTRO_DIST_MIN': 0.5, 
-    'FILTRO_DIST_MAX': 50.0, 
+    # NOTA: Agora o Python gera um SUPERSET (alta densidade).
+    # O filtro real de amostragem e offset será feito no JS.
+    'OFFSET_CABECEIRA_METROS': 0.0, # Python gera tudo, JS filtra
+    'AMOSTRAGEM_DIST_METROS': 1.0, # Alta densidade para o JS ter liberdade
+    'FILTRO_DIST_MIN': 0.1, 
+    'FILTRO_DIST_MAX': 100.0, 
 }
 
 def calcular_utm_epsg(lat, lon):
@@ -295,24 +297,19 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                 geom = row.geometry
                 length = geom.length
                 
-                # Cria pontos de amostragem a cada X metros, RESPEITANDO O OFFSET
-                start_dist = CONFIG['OFFSET_CABECEIRA_METROS']
-                end_dist = length - CONFIG['OFFSET_CABECEIRA_METROS']
+                # Cria pontos de amostragem a cada X metros (ALTA DENSIDADE para o Frontend filtrar)
+                # Exportamos metadados de posição para o JS poder aplicar o Offset dinamicamente
                 
-                if end_dist > start_dist:
-                    num_pontos = int((end_dist - start_dist) / CONFIG['AMOSTRAGEM_DIST_METROS'])
-                    if num_pontos < 1:
-                         # Linha curta demais para o offset, tenta pegar o meio se for maior que 2x offset
-                         if length > 2 * CONFIG['OFFSET_CABECEIRA_METROS']:
-                             pontos_amostra = [geom.interpolate(0.5, normalized=True)]
-                         else:
-                             pontos_amostra = []
-                    else:
-                        pontos_amostra = [geom.interpolate(d) for d in np.linspace(start_dist, end_dist, num_pontos)]
-                else:
-                    pontos_amostra = []
+                # Gerar pontos a cada 1 metro
+                distancias_amostragem = np.arange(0, length, CONFIG['AMOSTRAGEM_DIST_METROS'])
+                if len(distancias_amostragem) == 0:
+                     distancias_amostragem = [length / 2]
                 
-                for pt in pontos_amostra:
+                pontos_amostra = [geom.interpolate(d) for d in distancias_amostragem]
+                
+                for i, pt in enumerate(pontos_amostra):
+                    dist_from_start = distancias_amostragem[i]
+                    
                     # Busca linhas candidatas num raio de busca (ex: 50m)
                     candidatos_idx = list(sindex.intersection(pt.buffer(CONFIG['FILTRO_DIST_MAX']).bounds))
                     candidatos = linhas_gdf.iloc[candidatos_idx]
@@ -340,20 +337,25 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
                         distancias.append(min_dist)
                         # Salva a geometria da cota (Linha entre P1 e P2)
                         cotas_geometry.append(LineString([pt, ponto_vizinho_mais_proximo]))
-                        cotas_valores.append(min_dist)
+                        cotas_valores.append({
+                            'val': min_dist,
+                            'pos': dist_from_start,     # Posição na linha (metros do início)
+                            'len': length               # Comprimento total da linha pai
+                        })
 
         else:
             print("Não foi possível gerar linhas suficientes para calcular espaçamento.")
         
         distancias = np.array(distancias)
         
-        # Filtro básico de validade
-        mask_validos = (distancias > CONFIG['FILTRO_DIST_MIN']) & (distancias < CONFIG['FILTRO_DIST_MAX'])
+        # Filtro básico de validade para o RELATÓRIO ESTATÍSTICO (apenas)
+        # O Mapa receberá tudo.
+        mask_validos = (distancias > 0.5) & (distancias < 50.0) # Valores fixos razoáveis para estatística
         distancias_validas = distancias[mask_validos]
         
         # Filtrando também as cotas
-        cotas_geometry = [g for i, g in enumerate(cotas_geometry) if mask_validos[i]]
-        cotas_valores = [v for i, v in enumerate(cotas_valores) if mask_validos[i]]
+        # Para o JSON do mapa, vamos mandar TUDO que for geometricamente válido, o JS filtra visualmente.
+        # Mas para não explodir o tamanho do arquivo, podemos cortar extremos absurdos (>100m)
         
         if len(distancias_validas) > 0:
             # ------------------------------------------------------------------
