@@ -432,6 +432,13 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
     """
     print(f"Carregando arquivo: {caminho_shapefile}")
     
+    try:
+        tamanho_bytes = os.path.getsize(caminho_shapefile)
+        tamanho_mb = tamanho_bytes / (1024 * 1024)
+        print(f"Tamanho do arquivo: {tamanho_mb:.2f} MB")
+    except Exception as e:
+        print(f"Erro ao obter tamanho do arquivo: {e}")
+    
     # Tenta ler o arquivo usando Geopandas
     try:
         gdf = gpd.read_file(caminho_shapefile)
@@ -505,11 +512,8 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
             pontos_ativos = pontos[pontos['AppliedRate'] > 0]
             if not pontos_ativos.empty:
                 pontos = pontos_ativos
-                print(f"Filtrado para pontos com 'AppliedRate > 0'. Total: {len(pontos)}")
-            else:
-                print("Nenhum ponto com 'AppliedRate > 0' encontrado. Usando todos os pontos.")
 
-        print("Tentando gerar linhas a partir dos pontos (por tempo e direção)...")
+        print("Gerando linhas a partir dos pontos (por tempo e direção)...")
         # Agora retorna lista de dicts: {'indices': [...], 'time': timestamp}
         segmentos_info = gerar_segmentos_por_tempo_direcao(pontos)
         print(f"Segmentos gerados: {len(segmentos_info)}")
@@ -733,8 +737,8 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
             minimo = np.min(distancias_validas) # Mínimo absoluto ainda é útil ver
             maximo = np.max(distancias_validas) # Máximo absoluto idem
             
-            print(f"Média Estimada (Robusta): {media:.2f} m")
-            print(f"Mediana Estimada (Robusta): {mediana:.2f} m")
+            print(f"Média Estimada: {media:.2f} m")
+            # print(f"Mediana Estimada (Robusta): {mediana:.2f} m")
             print(f"Mínimo Absoluto: {minimo:.2f} m")
             
             # CÁLCULO DO TIRO MÉDIO (FILTRADO)
@@ -853,7 +857,7 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
     passos = CONFIG.get('LISTA_PASSOS_VISUALIZACAO', [1])
     
     for passo in passos:
-        print(f"Gerando mapa para passo de visualização: {passo} (1 a cada {passo})...")
+        print(f"Gerando mapa para visualização...")
         
         # Cria o objeto Mapa
         # Configura restrição de visão se solicitado
@@ -1356,14 +1360,17 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
         # Nome base com a data
         nome_base = f"Mapa Espaçamento Plantio - {data_str}"
 
-        # Salva o arquivo específico (com sufixo de densidade para diferenciação técnica)
-        nome_arquivo = f'{nome_base} - densidade_{passo}.html'
+        # Salva o arquivo específico
+        nome_arquivo = f'{nome_base}.html'
+        if len(passos) > 1:
+             nome_arquivo = f'{nome_base} - densidade_{passo}.html'
+
         output_file = os.path.join(pasta_saida_mapas, nome_arquivo)
         m.save(output_file)
         print(f"Mapa salvo com sucesso em: {output_file}")
         
-        # Se for o passo 1 (padrão), salva com o nome principal solicitado pelo usuário
-        if passo == 1:
+        # Se for o passo 1 (padrão) E tivermos multiplos passos, salva com o nome principal tambem
+        if passo == 1 and len(passos) > 1:
              output_file_default = os.path.join(pasta_saida_mapas, f'{nome_base}.html')
              m.save(output_file_default)
              print(f"Mapa principal salvo em: {output_file_default}")
@@ -1371,6 +1378,7 @@ def analisar_espacamento_e_gerar_mapa(caminho_shapefile, pasta_saida_mapas):
     print("Todos os mapas foram gerados com sucesso.")
 
 if __name__ == "__main__":
+    inicio_total = datetime.now()
     diretorio_atual = os.path.dirname(os.path.abspath(__file__))
     
     # 1. Busca o arquivo zip
@@ -1394,3 +1402,7 @@ if __name__ == "__main__":
         arquivo_alvo = arquivos_shp[0]
         pasta_mapas = os.path.join(diretorio_atual, "mapas")
         analisar_espacamento_e_gerar_mapa(arquivo_alvo, pasta_mapas)
+
+    fim_total = datetime.now()
+    tempo_decorrido = fim_total - inicio_total
+    print(f"\nTempo total de processamento: {str(tempo_decorrido).split('.')[0]}")
