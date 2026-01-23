@@ -581,21 +581,27 @@ class VisualizadorMapa:
         self.html_stats_agregado = ""
         self.bounds_geral = []
 
-    def iniciar_mapa(self, centro_inicial=[0,0]):
+    def iniciar_mapa(self, centro_inicial=[0,0], prefer_canvas=False):
         """Cria a instância base do mapa."""
         self.mapa = folium.Map(
             location=centro_inicial,
             zoom_start=self.config.MAPA_ZOOM_INICIAL,
             tiles=None,
             max_zoom=self.config.MAPA_MAX_ZOOM,
-            zoom_control=False, # Desativa padrão para evitar conflito visual, opcional
-            prefer_canvas=True
+            zoom_control=False,
+            prefer_canvas=prefer_canvas
         )
+        
+        # Meta Tag para Mobile (Crítico para evitar fundo branco/escala errada)
+        meta = """
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+        """
+        self.mapa.get_root().header.add_child(folium.Element(meta))
         
         # Adiciona TileLayer IMEDIATAMENTE (Garante que o fundo carregue independente dos overlays)
         folium.TileLayer(
             tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
-            attr='Found', name='Satélite', overlay=False, control=False,
+            attr='Google', name='Satélite', overlay=False, control=False,
             max_native_zoom=20,
             max_zoom=self.config.MAPA_MAX_ZOOM
         ).add_to(self.mapa)
@@ -608,7 +614,8 @@ class VisualizadorMapa:
         print(f"Adicionando layers para: {nome_arquivo_limpo}")
 
         # Preparação dos dados em WGS84
-        # Removido simplificação para evitar corrupção, mas mantemos o to_crs
+        # Revertido simplificação para manter detalhes completos (pedido do usuário)
+        
         gdf_heatmap = gpd.GeoDataFrame({'valor': metricas['heatmap_valores'], 'geometry': metricas['heatmap_geometria']}, crs=gdf_linhas.crs).to_crs(epsg=4326)
         gdf_cotas = gpd.GeoDataFrame({'valor': metricas['cotas_dados'], 'geometry': metricas['cotas_geometria']}, crs=gdf_linhas.crs).to_crs(epsg=4326)
         gdf_linhas_wgs = gdf_linhas.to_crs(epsg=4326)
@@ -700,13 +707,25 @@ class VisualizadorMapa:
             centro_lat = (coords[0][0] + coords[1][0])/2
             centro_lon = (coords[0][1] + coords[1][1])/2
             
+            # OTIMIZAÇÃO CSS: Usar classes em vez de style inline
+            # Classes: cota-base, cota-fundo-{true/false}, cota-{ok/abaixo/acima}
+            
+            tipo_cota = "ok"
+            if val < self.config.TOLERANCIA_MIN: tipo_cota = "abaixo"
+            elif val > self.config.TOLERANCIA_MAX: tipo_cota = "acima"
+            
+            fundo_cls = "cota-fundo-true" if self.config.FUNDO_COTAS else "cota-fundo-false"
+            
+            # Estilos dinâmicos que precisam ser inline (apenas cor)
+            style_inline = f"color: {cor};"
             if self.config.FUNDO_COTAS:
-                style_box = f"background: {'rgba(255,255,255,0.7)' if not is_alerta else cor}; color: {'black' if not is_alerta else 'white'}; border: 1px solid {cor}; border-radius: 4px; padding: 2px; font-weight: bold;"
-            else:
-                # Sem fundo: texto colorido com leve sombra para contraste
-                # Se for amarelo (acima), usa contorno preto para legibilidade. Caso contrário branco.
-                sombra_cor = "#000" if cor == self.config.ESTILO['cor_cota_acima'] else "#fff"
-                style_box = f"background: none; color: {cor}; font-weight: bold; text-shadow: -1px -1px 0 {sombra_cor}, 1px -1px 0 {sombra_cor}, -1px 1px 0 {sombra_cor}, 1px 1px 0 {sombra_cor};"
+                bg_color = 'rgba(255,255,255,0.7)' if not is_alerta else cor
+                text_color = 'black' if not is_alerta else 'white'
+                border_color = cor
+                style_inline = f"background: {bg_color}; color: {text_color}; border-color: {border_color};"
+            
+            # HTML minimalista
+            html=f'<div class="cota-base {fundo_cls} cota-{tipo_cota}" style="{style_inline}">{val:.2f}m</div>'
 
             folium.map.Marker(
                 [centro_lat, centro_lon],
@@ -714,7 +733,7 @@ class VisualizadorMapa:
                     icon_size=(0,0),
                     icon_anchor=(0,0),
                     class_name=f"cota-marker-container {zoom_class}", # Classe CSS aplicada aqui
-                    html=f'<div style="{style_box}; font-size: 10px; white-space: nowrap; pointer-events: none; transform: translate(-50%, -50%); display: inline-block;">{val:.2f}m</div>'
+                    html=html
                 )
             ).add_to(fg_cotas)
             
@@ -868,6 +887,24 @@ class VisualizadorMapa:
                 pointer-events: none !important;
                 text-shadow: 0 0 3px #000, 0 0 6px #000, 0 0 10px #000 !important;
             }
+            
+            /* Classes Otimizadas para Cotas (Reduz HTML size) */
+            .cota-base {
+                font-weight: bold; padding: 2px; border-radius: 4px;
+                display: inline-block; pointer-events: none;
+                transform: translate(-50%, -50%);
+            }
+            .cota-fundo-true {
+                border: 1px solid;
+            }
+            .cota-fundo-false {
+                background: none !important;
+                text-shadow: -1px -1px 0 #fff, 1px -1px 0 #fff, -1px 1px 0 #fff, 1px 1px 0 #fff;
+            }
+            /* Caso especial para amarelo (Acima) sem fundo: contorno preto */
+            .cota-fundo-false.cota-acima {
+                text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000 !important;
+            }
         </style>
         """
 
@@ -938,7 +975,7 @@ class VisualizadorMapa:
                                 var text = span ? span.innerText : lbl.innerText;
                                 
                                 // Regex para capturar [NomeArquivo]
-                                var match = text.match(/\[(.*?)\]/);
+                                var match = text.match(/\\[(.*?)\\]/);
                                 if (match) {{
                                     var filename = match[1];
                                     if (!groups[filename]) groups[filename] = [];
@@ -968,7 +1005,7 @@ class VisualizadorMapa:
                                     // Limpa o texto [Nome] do label para economizar espaço
                                     var span = lbl.querySelector('span');
                                     if (span) {{
-                                        span.innerHTML = span.innerHTML.replace(/\[.*?\]\s*/, '').trim();
+                                        span.innerHTML = span.innerHTML.replace(/\\[.*?\\]\\s*/, '').trim();
                                     }}
                                     // Ajuste estilo do label
                                     lbl.style.margin = '0';
@@ -989,6 +1026,19 @@ class VisualizadorMapa:
                             }}
                         }}
                     }}
+
+                    var inputs = layerControl ? layerControl.querySelectorAll('input[type="checkbox"]') : [];
+                    inputs.forEach(function(inp) {{
+                        inp.addEventListener('change', function() {{
+                            var layer = map._layers[inp.layerId];
+                            if (!layer) return;
+                            if (inp.checked) {{
+                                map.addLayer(layer);
+                            }} else {{
+                                map.removeLayer(layer);
+                            }}
+                        }});
+                    }});
                 }}, 800);
 
                 function updateVisibility() {{
@@ -1099,8 +1149,10 @@ def main():
 
     print(f"Arquivos encontrados: {len(arquivos_zips)}")
     
-    viz = VisualizadorMapa(TABELA_CONFIG)
-    viz.iniciar_mapa()
+    viz_svg = VisualizadorMapa(TABELA_CONFIG)
+    viz_canvas = VisualizadorMapa(TABELA_CONFIG)
+    viz_svg.iniciar_mapa(prefer_canvas=False)
+    viz_canvas.iniciar_mapa(prefer_canvas=True)
     
     html_painel_agregado = ""
     stats_globais = {'tiro_medio_soma': 0, 'tiro_medio_conta': 0, 'espacamento_soma': 0, 'espacamento_conta': 0}
@@ -1172,7 +1224,8 @@ def main():
             html_painel_agregado += f"<div><h4 style='margin:0 0 5px 0; text-align:center; font-weight:bold; font-size:12px;'>{nome_arquivo_limpo}</h4>{html_painel}</div>"
             
             # Adiciona ao Mapa
-            viz.adicionar_dados_arquivo(nome_arquivo_limpo, gdf_utm, metricas, gdf_linhas)
+            viz_svg.adicionar_dados_arquivo(nome_arquivo_limpo, gdf_utm, metricas, gdf_linhas)
+            viz_canvas.adicionar_dados_arquivo(nome_arquivo_limpo, gdf_utm, metricas, gdf_linhas)
             
         except Exception as e:
             print(f"  [ERRO CRÍTICO] Falha ao processar {nome_arquivo_limpo}: {e}")
@@ -1183,13 +1236,15 @@ def main():
     print("\n==========================================")
     print("Processamento concluído.")
     
-    ontem_str = (datetime.now() - timedelta(days=1)).strftime('%d-%m-%Y')
-    nome_final = f"Mapa Consolidado - {ontem_str}"
+    primeiro_nome = os.path.splitext(os.path.basename(arquivos_zips[0]))[0]
+    codigo_base = primeiro_nome.split('_')[0] if '_' in primeiro_nome else primeiro_nome
+    nome_base = f"Mapa Espaçamento Plantio - {codigo_base}"
     pasta_mapas = os.path.join(dir_atual, "mapas")
     os.makedirs(pasta_mapas, exist_ok=True)
     
     # Salva Mapa
-    viz.salvar_mapa(pasta_mapas, nome_final, html_painel_agregado)
+    viz_svg.salvar_mapa(pasta_mapas, f"{nome_base} - svg", html_painel_agregado)
+    viz_canvas.salvar_mapa(pasta_mapas, f"{nome_base} - canvas", html_painel_agregado)
 
     tempo_total = datetime.now() - inicio_proc
     print(f"Tempo total: {str(tempo_total).split('.')[0]}")
