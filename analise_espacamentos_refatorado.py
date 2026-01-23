@@ -583,6 +583,7 @@ class VisualizadorMapa:
 
     def iniciar_mapa(self, centro_inicial=[0,0], prefer_canvas=False):
         """Cria a instância base do mapa."""
+        self.prefer_canvas = prefer_canvas
         self.mapa = folium.Map(
             location=centro_inicial,
             zoom_start=self.config.MAPA_ZOOM_INICIAL,
@@ -636,9 +637,6 @@ class VisualizadorMapa:
 
         # --- HEATMAP (GeoJSON Otimizado) ---
         if self.config.LAYER_VISIBILITY['heatmap']:
-            fg_heat = folium.FeatureGroup(name=f"{prefix} {self.config.LAYER_NAMES['heatmap']}", show=True)
-            
-            # Constantes para estilo
             tol_min = self.config.TOLERANCIA_MIN
             tol_max = self.config.TOLERANCIA_MAX
             cor_ok = self.config.ESTILO['cor_cota_ok']
@@ -647,24 +645,49 @@ class VisualizadorMapa:
             weight = self.config.ESTILO['heatmap_espessura']
             opacity = self.config.ESTILO['heatmap_opacidade']
 
-            def style_heatmap(feature):
-                val = feature['properties']['valor']
-                cor = cor_ok
-                if val < tol_min: cor = cor_abaixo
-                elif val > tol_max: cor = cor_acima
-                return {
-                    'color': cor,
-                    'weight': weight,
-                    'opacity': opacity
-                }
+            if self.prefer_canvas:
+                gdf_ok = gdf_heatmap[(gdf_heatmap['valor'] >= tol_min) & (gdf_heatmap['valor'] <= tol_max)]
+                gdf_abaixo = gdf_heatmap[gdf_heatmap['valor'] < tol_min]
+                gdf_acima = gdf_heatmap[gdf_heatmap['valor'] > tol_max]
 
-            folium.GeoJson(
-                gdf_heatmap,
-                name=f"{prefix} Heatmap GeoJSON",
-                style_function=style_heatmap
-            ).add_to(fg_heat)
-            
-            fg_heat.add_to(self.mapa)
+                def add_heat_layer(gdf, nome, cor, show):
+                    if gdf is None or gdf.empty:
+                        return
+                    fg = folium.FeatureGroup(name=nome, show=show)
+                    folium.GeoJson(
+                        gdf,
+                        style_function=lambda feature: {
+                            'color': cor,
+                            'weight': weight,
+                            'opacity': opacity
+                        }
+                    ).add_to(fg)
+                    fg.add_to(self.mapa)
+
+                add_heat_layer(gdf_ok, f"{prefix} {self.config.LAYER_NAMES['heatmap']} (Completo)", cor_ok, True)
+                add_heat_layer(gdf_abaixo, f"{prefix} {self.config.LAYER_NAMES['heatmap']} (Abaixo)", cor_abaixo, False)
+                add_heat_layer(gdf_acima, f"{prefix} {self.config.LAYER_NAMES['heatmap']} (Acima)", cor_acima, False)
+            else:
+                fg_heat = folium.FeatureGroup(name=f"{prefix} {self.config.LAYER_NAMES['heatmap']}", show=True)
+
+                def style_heatmap(feature):
+                    val = feature['properties']['valor']
+                    cor = cor_ok
+                    if val < tol_min: cor = cor_abaixo
+                    elif val > tol_max: cor = cor_acima
+                    return {
+                        'color': cor,
+                        'weight': weight,
+                        'opacity': opacity
+                    }
+
+                folium.GeoJson(
+                    gdf_heatmap,
+                    name=f"{prefix} Heatmap GeoJSON",
+                    style_function=style_heatmap
+                ).add_to(fg_heat)
+                
+                fg_heat.add_to(self.mapa)
 
         # --- COTAS (Com Lógica de Zoom) ---
         # Separamos em Grupos OK (Zoom dependent) e Alertas (Sempre visible)
@@ -798,6 +821,15 @@ class VisualizadorMapa:
         # folium.TileLayer(...).add_to(self.mapa) # REMOVIDO para evitar duplicata
 
         # 1. CSS (Zoom Classes + Painel Minimzável + Ícone Régua)
+        canvas_panel_css = ""
+        if self.prefer_canvas:
+            canvas_panel_css = """
+            .info-panel {
+                left: 12px; right: auto; transform: none;
+                min-width: 280px; width: 320px; max-width: 42vw;
+            }
+            """
+
         css = """
         <style>
             /* Reset básico para garantir full screen */
@@ -876,15 +908,14 @@ class VisualizadorMapa:
             }
             .leaflet-control-layers-list { margin-bottom: 0; }
             .leaflet-control-layers-overlays {
-                 display: block; width: 100%;
+                 display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+                 gap: 8px 10px; width: 100%;
             }
-            .leaflet-control-layers-overlays .layer-row {
-                 display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px;
-                 width: 100%; padding: 2px 0; border-bottom: 1px solid #eee;
+            .leaflet-control-layers-overlays .layer-col {
+                 display: flex; flex-direction: column; gap: 4px; width: 100%;
             }
-            .leaflet-control-layers-overlays .layer-row:last-child { border-bottom: none; }
             .leaflet-control-layers-overlays label {
-                 box-sizing: border-box; margin: 0; font-size: 12px; width: auto;
+                 box-sizing: border-box; margin: 0; font-size: 12px; width: 100%;
                  display: inline-flex; align-items: center; background: transparent; padding: 2px 0; border-radius: 4px; border: none;
             }
             .cluster-marker-container {
@@ -910,8 +941,10 @@ class VisualizadorMapa:
             .cota-fundo-false.cota-acima {
                 text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000 !important;
             }
+            __CANVAS_PANEL_CSS__
         </style>
         """
+        css = css.replace("__CANVAS_PANEL_CSS__", canvas_panel_css)
 
         # 2. JS (Zoom + Toggle Panel + Zoom Display)
         map_id = self.mapa.get_name()
@@ -922,11 +955,14 @@ class VisualizadorMapa:
         
         js = f"""
         <script>
-            function togglePanel() {{
-                var panel = document.querySelector('.info-panel');
+            function togglePanel(panelId) {{
+                var panel = document.getElementById(panelId);
+                if (!panel) return;
                 panel.classList.toggle('minimized');
-                var btn = document.querySelector('.toggle-btn');
-                btn.innerText = panel.classList.contains('minimized') ? '+' : '-';
+                var btn = panel.querySelector('.toggle-btn');
+                if (btn) {{
+                    btn.innerText = panel.classList.contains('minimized') ? '+' : '-';
+                }}
             }}
 
             document.addEventListener("DOMContentLoaded", function() {{
@@ -991,7 +1027,9 @@ class VisualizadorMapa:
 
                         var overlaysContainer = layerControl.querySelector('.leaflet-control-layers-overlays');
                         var overlayLabels = layerControl.querySelectorAll('.leaflet-control-layers-overlays label');
-                        var trendByGroup = {{}};
+                        var trendFullByGroup = {{}};
+                        var trendBelowByGroup = {{}};
+                        var trendAboveByGroup = {{}};
                         var cotasByGroup = {{}};
 
                         if (overlaysContainer) {{
@@ -1008,15 +1046,15 @@ class VisualizadorMapa:
 
                             overlaysContainer.innerHTML = '';
 
-                            Object.keys(groups).forEach(function(groupName) {{
-                                var row = document.createElement('div');
-                                row.className = 'layer-row';
+                            Object.keys(groups).sort().forEach(function(groupName) {{
+                                var col = document.createElement('div');
+                                col.className = 'layer-col';
 
                                 groups[groupName].forEach(function(label) {{
-                                    row.appendChild(label);
+                                    col.appendChild(label);
                                 }});
 
-                                overlaysContainer.appendChild(row);
+                                overlaysContainer.appendChild(col);
                             }});
                         }}
 
@@ -1028,27 +1066,76 @@ class VisualizadorMapa:
                             var match = text.match(/\\[(.*?)\\]/);
                             if (!match) return;
                             var group = match[1];
-                            if (text.indexOf('Mapa de Tendência') !== -1) {{
-                                trendByGroup[group] = input;
+                            if (text.indexOf('Mapa de Tendência (Completo)') !== -1) {{
+                                trendFullByGroup[group] = input;
+                            }}
+                            if (text.indexOf('Mapa de Tendência (Abaixo)') !== -1) {{
+                                trendBelowByGroup[group] = input;
+                            }}
+                            if (text.indexOf('Mapa de Tendência (Acima)') !== -1) {{
+                                trendAboveByGroup[group] = input;
                             }}
                             if (text.indexOf('Cotas') !== -1) {{
                                 cotasByGroup[group] = input;
                             }}
                         }});
 
-                        function linkTrendToCotas(trendInput, cotasInput) {{
-                            if (!trendInput || !cotasInput) return;
-                            trendInput.addEventListener('change', function() {{
-                                if (!this.checked && cotasInput.checked) {{
-                                    cotasInput.checked = false;
-                                    cotasInput.dispatchEvent(new Event('change'));
+                        function bindTrendControls(groupKey) {{
+                            var fullInput = trendFullByGroup[groupKey];
+                            var belowInput = trendBelowByGroup[groupKey];
+                            var aboveInput = trendAboveByGroup[groupKey];
+                            var cotasInput = cotasByGroup[groupKey];
+
+                            function splitChecked() {{
+                                return (belowInput && belowInput.checked) || (aboveInput && aboveInput.checked);
+                            }}
+
+                            function hideFullIfSplitChecked() {{
+                                if (!fullInput) return;
+                                if (splitChecked() && fullInput.checked) {{
+                                    fullInput.checked = false;
+                                    fullInput.dispatchEvent(new Event('change'));
                                 }}
-                            }});
+                            }}
+
+                            if (belowInput) {{
+                                belowInput.addEventListener('change', function() {{
+                                    if (this.checked) {{
+                                        hideFullIfSplitChecked();
+                                    }}
+                                }});
+                            }}
+
+                            if (aboveInput) {{
+                                aboveInput.addEventListener('change', function() {{
+                                    if (this.checked) {{
+                                        hideFullIfSplitChecked();
+                                    }}
+                                }});
+                            }}
+
+                            if (fullInput && cotasInput) {{
+                                fullInput.addEventListener('change', function() {{
+                                    if (!this.checked && cotasInput.checked && !splitChecked()) {{
+                                        cotasInput.checked = false;
+                                        cotasInput.dispatchEvent(new Event('change'));
+                                    }}
+                                }});
+                            }}
+
+                            hideFullIfSplitChecked();
                         }}
 
-                        for (var g in trendByGroup) {{
-                            linkTrendToCotas(trendByGroup[g], cotasByGroup[g]);
+                        var groupKeys = {{}};
+                        Object.keys(trendFullByGroup).forEach(function(k) {{ groupKeys[k] = true; }});
+                        Object.keys(trendBelowByGroup).forEach(function(k) {{ groupKeys[k] = true; }});
+                        Object.keys(trendAboveByGroup).forEach(function(k) {{ groupKeys[k] = true; }});
+                        Object.keys(cotasByGroup).forEach(function(k) {{ groupKeys[k] = true; }});
+
+                        for (var g in groupKeys) {{
+                            bindTrendControls(g);
                         }}
+
                     }}
 
                     // Removemos a lógica antiga de "Reforço de Eventos" pois agora controlamos diretamente
@@ -1088,39 +1175,39 @@ class VisualizadorMapa:
         
         # Painel HTML Estruturado
         painel_div = f'''
-        <div class="info-panel">
-            <div class="panel-header" onclick="togglePanel()">
-                <div class="panel-title">Informações</div>
-                <button class="toggle-btn">-</button>
-            </div>
-            
-            <!-- Legenda de Cores -->
-            <div style="display: flex; justify-content: center; align-items: center; gap: 15px; padding: 5px; background: #fafafa; border-bottom: 1px solid #ddd; font-size: 11px;">
-                <div style="display: flex; align-items: center; gap: 4px;">
-                    <div style="width: 12px; height: 12px; background: {self.config.ESTILO['cor_cota_ok']}; border: 1px solid #999; border-radius: 2px;"></div>
-                    <span>OK</span>
+        <div class="info-panel" id="info-panel">
+                <div class="panel-header" onclick="togglePanel('info-panel')">
+                    <div class="panel-title">Informações</div>
+                    <button class="toggle-btn">-</button>
                 </div>
-                <div style="display: flex; align-items: center; gap: 4px;">
-                    <div style="width: 12px; height: 12px; background: {self.config.ESTILO['cor_cota_abaixo']}; border: 1px solid #999; border-radius: 2px;"></div>
-                    <span>Abaixo</span>
+                
+                <!-- Legenda de Cores -->
+                <div style="display: flex; justify-content: center; align-items: center; gap: 15px; padding: 5px; background: #fafafa; border-bottom: 1px solid #ddd; font-size: 11px;">
+                    <div style="display: flex; align-items: center; gap: 4px;">
+                        <div style="width: 12px; height: 12px; background: {self.config.ESTILO['cor_cota_ok']}; border: 1px solid #999; border-radius: 2px;"></div>
+                        <span>OK</span>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 4px;">
+                        <div style="width: 12px; height: 12px; background: {self.config.ESTILO['cor_cota_abaixo']}; border: 1px solid #999; border-radius: 2px;"></div>
+                        <span>Abaixo</span>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 4px;">
+                        <div style="width: 12px; height: 12px; background: {self.config.ESTILO['cor_cota_acima']}; border: 1px solid #999; border-radius: 2px;"></div>
+                        <span>Acima</span>
+                    </div>
                 </div>
-                <div style="display: flex; align-items: center; gap: 4px;">
-                    <div style="width: 12px; height: 12px; background: {self.config.ESTILO['cor_cota_acima']}; border: 1px solid #999; border-radius: 2px;"></div>
-                    <span>Acima</span>
+                
+                <!-- Area de Layers Fixa (Não some no minimize) -->
+                <div class="layers-container">
+                    <!-- Layers injetados aqui via JS -->
                 </div>
-            </div>
-            
-            <!-- Area de Layers Fixa (Não some no minimize) -->
-            <div class="layers-container">
-                <!-- Layers injetados aqui via JS -->
-            </div>
 
-            <!-- Conteudo Minimizavel -->
-            <div class="panel-content">
-                <div class="stats-grid">
-                    {html_painel_global}
+                <!-- Conteudo Minimizavel -->
+                <div class="panel-content">
+                    <div class="stats-grid">
+                        {html_painel_global}
+                    </div>
                 </div>
-            </div>
         </div>
         '''
         
