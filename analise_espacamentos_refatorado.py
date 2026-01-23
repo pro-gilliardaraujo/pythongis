@@ -42,6 +42,9 @@ class ConfiguracaoAnalise:
         self.MAPA_MAX_ZOOM = 24
         self.MAPA_LIMITAR_VISAO = True
         
+        # Opções Visuais
+        self.FUNDO_COTAS = False # Se True, exibe retângulo colorido. Se False, apenas texto colorido.
+        
         # Camadas do Mapa
         self.GERAR_CAMADAS_OCULTAS = False
         self.LAYER_NAMES = {
@@ -70,7 +73,7 @@ class ConfiguracaoAnalise:
             'linha_opacidade': 0.6,
             'cor_cota_ok': '#00FF00',
             'cor_cota_abaixo': '#FF0000',
-            'cor_cota_acima': '#FFA500',
+            'cor_cota_acima': '#FFFF00', # Amarelo (antes era #FFA500 Laranja)
             'heatmap_espessura': 3,
             'heatmap_opacidade': 0.8
         }
@@ -538,27 +541,35 @@ class GeradorRelatorio:
     def gerar_html_tabela(media: float, tiro_medio: float, gdf_linhas: gpd.GeoDataFrame, config: ConfiguracaoAnalise) -> str:
         """Gera o HTML flutuante com as estatísticas para o mapa."""
         
-        # Tabela Geral
+        # Tabela Geral (Ajustado para Row Única e Compacta - Label em frente ao valor)
         html = f"""
-        <table style="border-collapse: collapse; width: 100%; border: none;">
-            <tr><td><b>Espaçamento médio</b></td><td>{media:.2f} m</td></tr>
-            <tr><td><b>Tiro médio (Geral)</b></td><td>{tiro_medio:.2f} m</td></tr>
-        </table>
+        <div style="display: flex; justify-content: center; align-items: center; gap: 15px; font-size: 12px; margin-bottom: 5px;">
+            <div>
+                <b>Espaçamento médio:</b> {media:.2f} m
+            </div>
+            <div style="width: 1px; height: 12px; background: #ccc;"></div>
+            <div>
+                <b>Tiro médio (Geral):</b> {tiro_medio:.2f} m
+            </div>
+        </div>
         """
         
         # Tabela por Cluster (Talhão)
         if 'cluster_label' in gdf_linhas.columns:
             html += "<table style='border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 5px; border-top: none; border: none;'>"
-            html += "<tr><th>Área</th><th>Tiro Médio*</th></tr>"
+            html += "<tr><th style='text-align:center;'>Área</th><th style='text-align:center;'>Tiro Médio*</th></tr>"
             
             labels = sorted(gdf_linhas['cluster_label'].dropna().unique())
             for lab in labels:
+                # Remove prefixo do arquivo para exibir apenas a letra/numero da área
+                lab_curto = lab.split(' ')[-1] if ' ' in lab else lab
+                
                 grupo = gdf_linhas[gdf_linhas['cluster_label'] == lab]
                 # Filtra tiros curtos
                 tiros = grupo[grupo.geometry.length >= config.MIN_TIRO_STATS]
                 if tiros.empty: tiros = grupo
                 media_local = tiros.geometry.length.mean()
-                html += f"<tr><td style='text-align:center;'><b>{lab}</b></td><td style='text-align:left;'>{media_local:.1f}m</td></tr>"
+                html += f"<tr><td style='text-align:center;'><b>{lab}</b></td><td style='text-align:center;'>{media_local:.1f}m</td></tr>"
             html += "</table>"
             
         return html
@@ -581,6 +592,14 @@ class VisualizadorMapa:
             prefer_canvas=True
         )
         
+        # Adiciona TileLayer IMEDIATAMENTE (Garante que o fundo carregue independente dos overlays)
+        folium.TileLayer(
+            tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+            attr='Found', name='Satélite', overlay=False, control=False,
+            max_native_zoom=20,
+            max_zoom=self.config.MAPA_MAX_ZOOM
+        ).add_to(self.mapa)
+        
     def adicionar_dados_arquivo(self, nome_arquivo_limpo: str, gdf_dados: gpd.GeoDataFrame, metricas: dict, gdf_linhas: gpd.GeoDataFrame):
         """Adiciona layers de um arquivo específico ao mapa existente."""
         if not self.mapa:
@@ -589,6 +608,7 @@ class VisualizadorMapa:
         print(f"Adicionando layers para: {nome_arquivo_limpo}")
 
         # Preparação dos dados em WGS84
+        # Removido simplificação para evitar corrupção, mas mantemos o to_crs
         gdf_heatmap = gpd.GeoDataFrame({'valor': metricas['heatmap_valores'], 'geometry': metricas['heatmap_geometria']}, crs=gdf_linhas.crs).to_crs(epsg=4326)
         gdf_cotas = gpd.GeoDataFrame({'valor': metricas['cotas_dados'], 'geometry': metricas['cotas_geometria']}, crs=gdf_linhas.crs).to_crs(epsg=4326)
         gdf_linhas_wgs = gdf_linhas.to_crs(epsg=4326)
@@ -658,7 +678,9 @@ class VisualizadorMapa:
                 cor = self.config.ESTILO['cor_cota_abaixo']
             elif val > self.config.TOLERANCIA_MAX:
                 cor = self.config.ESTILO['cor_cota_acima']
-            coords = [(pt[1], pt[0]) for pt in row.geometry.coords] # LatLon
+            
+            # Arredonda coordenadas para 6 casas decimais para reduzir tamanho do HTML
+            coords = [(round(pt[1], 6), round(pt[0], 6)) for pt in row.geometry.coords] # LatLon
             
             
             # Adiciona Linha da Cota
@@ -678,8 +700,14 @@ class VisualizadorMapa:
             centro_lat = (coords[0][0] + coords[1][0])/2
             centro_lon = (coords[0][1] + coords[1][1])/2
             
-            style_box = f"background: {'rgba(255,255,255,0.7)' if not is_alerta else cor}; color: {'black' if not is_alerta else 'white'}; border: 1px solid {cor}; border-radius: 4px; padding: 2px; font-weight: bold;"
-            
+            if self.config.FUNDO_COTAS:
+                style_box = f"background: {'rgba(255,255,255,0.7)' if not is_alerta else cor}; color: {'black' if not is_alerta else 'white'}; border: 1px solid {cor}; border-radius: 4px; padding: 2px; font-weight: bold;"
+            else:
+                # Sem fundo: texto colorido com leve sombra para contraste
+                # Se for amarelo (acima), usa contorno preto para legibilidade. Caso contrário branco.
+                sombra_cor = "#000" if cor == self.config.ESTILO['cor_cota_acima'] else "#fff"
+                style_box = f"background: none; color: {cor}; font-weight: bold; text-shadow: -1px -1px 0 {sombra_cor}, 1px -1px 0 {sombra_cor}, -1px 1px 0 {sombra_cor}, 1px 1px 0 {sombra_cor};"
+
             folium.map.Marker(
                 [centro_lat, centro_lon],
                 icon=folium.DivIcon(
@@ -747,16 +775,15 @@ class VisualizadorMapa:
         # Adiciona TileLayer AGORA com bounds (Recorte de background)
         # max_native_zoom=20 permite zoom digital além do nível 20
         # control=False esconde do Layer Control
-        folium.TileLayer(
-            tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
-            attr='Found', name='Satélite', overlay=False, control=False,
-            max_native_zoom=20,
-            max_zoom=self.config.MAPA_MAX_ZOOM
-        ).add_to(self.mapa)
+        # (O TileLayer já foi adicionado em iniciar_mapa para garantir carregamento, mas aqui ajustamos bounds se necessário)
+        # folium.TileLayer(...).add_to(self.mapa) # REMOVIDO para evitar duplicata
 
         # 1. CSS (Zoom Classes + Painel Minimzável + Ícone Régua)
         css = """
         <style>
+            /* Reset básico para garantir full screen */
+            body, html, .folium-map { width: 100%; height: 100%; margin: 0; padding: 0; }
+            
             .info-panel {
                 position: fixed; bottom: 2px; left: 50%; transform: translateX(-50%);
                 z-index: 9999; background: rgba(255,255,255,0.95); padding: 0;
@@ -886,13 +913,81 @@ class VisualizadorMapa:
                 setTimeout(function() {{
                     var layerControl = document.querySelector('.leaflet-control-layers');
                     var layersContainer = document.querySelector('.layers-container');
+                    
                     if (layerControl && layersContainer) {{
                         layersContainer.appendChild(layerControl);
                         layerControl.classList.add('leaflet-control-layers-expanded');
+                        
                         var base = layerControl.querySelector('.leaflet-control-layers-base');
                         if (base) {{ base.style.display = 'none'; }}
+                        
                         var overlays = layerControl.querySelector('.leaflet-control-layers-overlays');
-                        if (overlays) {{ overlays.style.display = 'flex'; overlays.style.flexDirection = 'column'; }}
+                        if (overlays) {{ 
+                            overlays.style.display = 'flex'; 
+                            overlays.style.flexDirection = 'column';
+                            overlays.style.width = '100%';
+                            
+                            // --- REORGANIZAÇÃO EM ROWS POR ARQUIVO ---
+                            // Pega labels originais
+                            var labels = Array.from(overlays.querySelectorAll('label'));
+                            var groups = {{}};
+                            var others = [];
+                            
+                            labels.forEach(function(lbl) {{
+                                var span = lbl.querySelector('span');
+                                var text = span ? span.innerText : lbl.innerText;
+                                
+                                // Regex para capturar [NomeArquivo]
+                                var match = text.match(/\[(.*?)\]/);
+                                if (match) {{
+                                    var filename = match[1];
+                                    if (!groups[filename]) groups[filename] = [];
+                                    groups[filename].push(lbl);
+                                }} else {{
+                                    others.push(lbl);
+                                }}
+                            }});
+                            
+                            // Limpa container
+                            overlays.innerHTML = '';
+                            
+                            // Cria Rows por Arquivo
+                            for (var file in groups) {{
+                                var row = document.createElement('div');
+                                row.className = 'layer-row';
+                                row.style.cssText = 'display: flex; align-items: center; flex-wrap: wrap; gap: 8px; border-bottom: 1px solid #eee; padding: 4px 0; width: 100%;';
+                                
+                                // Nome do Arquivo (destaque)
+                                var title = document.createElement('div');
+                                title.style.cssText = 'font-weight: bold; font-size: 11px; color: #333; margin-right: 5px; min-width: 80px;';
+                                title.innerText = file;
+                                row.appendChild(title);
+                                
+                                // Layers do Arquivo
+                                groups[file].forEach(function(lbl) {{
+                                    // Limpa o texto [Nome] do label para economizar espaço
+                                    var span = lbl.querySelector('span');
+                                    if (span) {{
+                                        span.innerHTML = span.innerHTML.replace(/\[.*?\]\s*/, '').trim();
+                                    }}
+                                    // Ajuste estilo do label
+                                    lbl.style.margin = '0';
+                                    lbl.style.width = 'auto';
+                                    lbl.style.display = 'inline-flex';
+                                    row.appendChild(lbl);
+                                }});
+                                
+                                overlays.appendChild(row);
+                            }}
+                            
+                            // Outros Layers (ex: Clusters, etc)
+                            if (others.length > 0) {{
+                                var row = document.createElement('div');
+                                row.style.cssText = 'display: flex; flex-direction: column; gap: 2px; padding: 4px 0;';
+                                others.forEach(function(lbl) {{ overlays.appendChild(lbl); }});
+                                overlays.appendChild(row);
+                            }}
+                        }}
                     }}
                 }}, 800);
 
@@ -935,6 +1030,22 @@ class VisualizadorMapa:
                 <button class="toggle-btn">-</button>
             </div>
             
+            <!-- Legenda de Cores -->
+            <div style="display: flex; justify-content: center; align-items: center; gap: 15px; padding: 5px; background: #fafafa; border-bottom: 1px solid #ddd; font-size: 11px;">
+                <div style="display: flex; align-items: center; gap: 4px;">
+                    <div style="width: 12px; height: 12px; background: {self.config.ESTILO['cor_cota_ok']}; border: 1px solid #999; border-radius: 2px;"></div>
+                    <span>OK</span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 4px;">
+                    <div style="width: 12px; height: 12px; background: {self.config.ESTILO['cor_cota_abaixo']}; border: 1px solid #999; border-radius: 2px;"></div>
+                    <span>Abaixo</span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 4px;">
+                    <div style="width: 12px; height: 12px; background: {self.config.ESTILO['cor_cota_acima']}; border: 1px solid #999; border-radius: 2px;"></div>
+                    <span>Acima</span>
+                </div>
+            </div>
+            
             <!-- Area de Layers Fixa (Não some no minimize) -->
             <div class="layers-container">
                 <!-- Layers injetados aqui via JS -->
@@ -953,8 +1064,9 @@ class VisualizadorMapa:
         self.mapa.get_root().html.add_child(folium.Element(js))
         self.mapa.get_root().html.add_child(folium.Element(painel_div))
 
-        MeasureControl(position='topright', primary_length_unit='meters', active_color='#00FF00').add_to(self.mapa)
-        Fullscreen().add_to(self.mapa)
+        # MeasureControl removido conforme solicitado
+        # MeasureControl(position='topright', primary_length_unit='meters', active_color='#00FF00').add_to(self.mapa)
+        # Fullscreen().add_to(self.mapa)
         folium.LayerControl(collapsed=False).add_to(self.mapa)
 
         caminho_final = os.path.join(pasta_saida, f"{nome_base}.html")
@@ -1057,7 +1169,7 @@ def main():
 
             # HTML Parcial (Com título do arquivo) - Wrapped em div para grid
             html_painel = GeradorRelatorio.gerar_html_tabela(media, tiro_medio, gdf_linhas, TABELA_CONFIG)
-            html_painel_agregado += f"<div><h4 style='margin:0 0 5px 0;'>{nome_arquivo_limpo}</h4>{html_painel}</div>"
+            html_painel_agregado += f"<div><h4 style='margin:0 0 5px 0; text-align:center; font-weight:bold; font-size:12px;'>{nome_arquivo_limpo}</h4>{html_painel}</div>"
             
             # Adiciona ao Mapa
             viz.adicionar_dados_arquivo(nome_arquivo_limpo, gdf_utm, metricas, gdf_linhas)
