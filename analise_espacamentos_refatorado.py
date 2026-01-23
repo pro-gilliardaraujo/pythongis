@@ -577,7 +577,8 @@ class VisualizadorMapa:
             zoom_start=self.config.MAPA_ZOOM_INICIAL,
             tiles=None,
             max_zoom=self.config.MAPA_MAX_ZOOM,
-            zoom_control=False # Desativa padrão para evitar conflito visual, opcional
+            zoom_control=False, # Desativa padrão para evitar conflito visual, opcional
+            prefer_canvas=True
         )
         
     def adicionar_dados_arquivo(self, nome_arquivo_limpo: str, gdf_dados: gpd.GeoDataFrame, metricas: dict, gdf_linhas: gpd.GeoDataFrame):
@@ -606,18 +607,36 @@ class VisualizadorMapa:
         # PASSO para cotas OK (filtra somente 1 a cada X)
         passo_vis = self.config.PASSOS_VISUALIZACAO[0] if self.config.PASSOS_VISUALIZACAO else 10
 
-        # --- HEATMAP ---
+        # --- HEATMAP (GeoJSON Otimizado) ---
         if self.config.LAYER_VISIBILITY['heatmap']:
             fg_heat = folium.FeatureGroup(name=f"{prefix} {self.config.LAYER_NAMES['heatmap']}", show=True)
-            for _, row in gdf_heatmap.iterrows():
-                val = row['valor']
-                cor = self.config.ESTILO['cor_cota_ok']
-                if val < self.config.TOLERANCIA_MIN:
-                    cor = self.config.ESTILO['cor_cota_abaixo']
-                elif val > self.config.TOLERANCIA_MAX:
-                    cor = self.config.ESTILO['cor_cota_acima']
-                coords = [(pt[1], pt[0]) for pt in row.geometry.coords]
-                folium.PolyLine(coords, color=cor, weight=self.config.ESTILO['heatmap_espessura'], opacity=self.config.ESTILO['heatmap_opacidade']).add_to(fg_heat)
+            
+            # Constantes para estilo
+            tol_min = self.config.TOLERANCIA_MIN
+            tol_max = self.config.TOLERANCIA_MAX
+            cor_ok = self.config.ESTILO['cor_cota_ok']
+            cor_abaixo = self.config.ESTILO['cor_cota_abaixo']
+            cor_acima = self.config.ESTILO['cor_cota_acima']
+            weight = self.config.ESTILO['heatmap_espessura']
+            opacity = self.config.ESTILO['heatmap_opacidade']
+
+            def style_heatmap(feature):
+                val = feature['properties']['valor']
+                cor = cor_ok
+                if val < tol_min: cor = cor_abaixo
+                elif val > tol_max: cor = cor_acima
+                return {
+                    'color': cor,
+                    'weight': weight,
+                    'opacity': opacity
+                }
+
+            folium.GeoJson(
+                gdf_heatmap,
+                name=f"{prefix} Heatmap GeoJSON",
+                style_function=style_heatmap
+            ).add_to(fg_heat)
+            
             fg_heat.add_to(self.mapa)
 
         # --- COTAS (Com Lógica de Zoom) ---
@@ -673,16 +692,24 @@ class VisualizadorMapa:
             
         fg_cotas.add_to(self.mapa)
 
-        # --- LINHAS TRAJETÓRIA ---
+        # --- LINHAS TRAJETÓRIA (GeoJSON Otimizado) ---
         if self.config.LAYER_VISIBILITY['linhas']:
             fg_linhas = folium.FeatureGroup(name=f"{prefix} {self.config.LAYER_NAMES['linhas']}", show=False)
-            col_geo = gdf_linhas_wgs.geometry
-            # Simplifica renderização: MultiLineString única se possível ou iterar
-            # Iterando para manter estilo consistente
-            for geom in col_geo:
-                if geom.geom_type == 'LineString':
-                    coords = [(pt[1], pt[0]) for pt in geom.coords]
-                    folium.PolyLine(coords, color=self.config.ESTILO['cor_linha'], weight=self.config.ESTILO['linha_espessura'], opacity=self.config.ESTILO['linha_opacidade']).add_to(fg_linhas)
+            
+            cor_linha = self.config.ESTILO['cor_linha']
+            weight_linha = self.config.ESTILO['linha_espessura']
+            opacity_linha = self.config.ESTILO['linha_opacidade']
+
+            folium.GeoJson(
+                gdf_linhas_wgs,
+                name=f"{prefix} Linhas GeoJSON",
+                style_function=lambda feature: {
+                    'color': cor_linha,
+                    'weight': weight_linha,
+                    'opacity': opacity_linha
+                }
+            ).add_to(fg_linhas)
+            
             fg_linhas.add_to(self.mapa)
 
         # --- CLUSTERS LABELS ---
