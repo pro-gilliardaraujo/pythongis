@@ -12,6 +12,7 @@ Refatoração seguindo princípios de Código Limpo e Design Centrado no Humano.
 """
 
 import os
+import sys
 import math
 import glob
 import zipfile
@@ -37,6 +38,7 @@ class ConfiguracaoAnalise:
     def __init__(self):
         # Visualização
         self.MAPA_ZOOM_INICIAL = 18
+        self.MAPA_MIN_ZOOM = 16 # Mantido para referência, mas não forçado no mapa base se não desejado
         self.MAPA_MAX_ZOOM = 24
         self.MAPA_LIMITAR_VISAO = True
         
@@ -64,12 +66,13 @@ class ConfiguracaoAnalise:
             'cor_ponto_ativo': '#00FF00',
             'cor_ponto_inativo': '#FF0000',
             'cor_linha': '#00FFFF',
-            'linha_espessura': 3,
+            'linha_espessura': 1,
             'linha_opacidade': 0.6,
             'cor_cota_ok': '#00FF00',
-            'cor_cota_alerta': '#FF0000',
-            'heatmap_espessura': 5,
-            'heatmap_opacidade': 0.7
+            'cor_cota_abaixo': '#FF0000',
+            'cor_cota_acima': '#FFA500',
+            'heatmap_espessura': 3,
+            'heatmap_opacidade': 0.8
         }
         
         # Tolerâncias de Qualidade
@@ -101,6 +104,8 @@ class ConfiguracaoAnalise:
         
         # Output
         self.PASSOS_VISUALIZACAO = [10] # 1 a cada X cotas
+        self.ZOOM_MIN_COTAS = 18 # Zoom mínimo para exibir cotas
+        self.ZOOM_MAX_CLUSTERS = 18 # Zoom máximo para exibir clusters (acima disso, oculta)
 
 TABELA_CONFIG = ConfiguracaoAnalise()
 
@@ -132,16 +137,19 @@ class GerenciadorArquivos:
     """Responsável por encontrar, extrair e carregar arquivos."""
     
     @staticmethod
-    def buscar_zip_mais_recente(diretorio: str) -> Optional[str]:
+    def buscar_todos_zips(diretorio: str) -> List[str]:
+        """Retorna lista de todos os arquivos ZIP no diretório."""
         arquivos = glob.glob(os.path.join(diretorio, "*.zip"))
-        if not arquivos:
-            return None
         # Ordena por data de modificação (mais recente primeiro)
         arquivos.sort(key=os.path.getmtime, reverse=True)
-        return arquivos[0]
+        return arquivos
 
     @staticmethod
-    def extrair_zip(caminho_zip: str, pasta_destino: str) -> str:
+    def extrair_zip(caminho_zip: str, pasta_base_extracao: str) -> str:
+        """Extrai o ZIP para uma subpasta única baseada no nome do arquivo."""
+        nome_arquivo = os.path.splitext(os.path.basename(caminho_zip))[0]
+        pasta_destino = os.path.join(pasta_base_extracao, nome_arquivo)
+        
         os.makedirs(pasta_destino, exist_ok=True)
         with zipfile.ZipFile(caminho_zip, 'r') as zip_ref:
             zip_ref.extractall(pasta_destino)
@@ -532,7 +540,7 @@ class GeradorRelatorio:
         
         # Tabela Geral
         html = f"""
-        <table border="1" style="border-collapse: collapse; width: 100%;">
+        <table style="border-collapse: collapse; width: 100%; border: none;">
             <tr><td><b>Espaçamento médio</b></td><td>{media:.2f} m</td></tr>
             <tr><td><b>Tiro médio (Geral)</b></td><td>{tiro_medio:.2f} m</td></tr>
         </table>
@@ -540,7 +548,7 @@ class GeradorRelatorio:
         
         # Tabela por Cluster (Talhão)
         if 'cluster_label' in gdf_linhas.columns:
-            html += "<table border='1' style='border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 5px; border-top: none;'>"
+            html += "<table style='border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 5px; border-top: none; border: none;'>"
             html += "<tr><th>Área</th><th>Tiro Médio*</th></tr>"
             
             labels = sorted(gdf_linhas['cluster_label'].dropna().unique())
@@ -558,275 +566,494 @@ class GeradorRelatorio:
 class VisualizadorMapa:
     def __init__(self, config: ConfiguracaoAnalise):
         self.config = config
+        self.mapa = None
+        self.html_stats_agregado = ""
+        self.bounds_geral = []
 
-    def gerar_mapas(self, gdf_dados: gpd.GeoDataFrame, metricas: dict, gdf_linhas: gpd.GeoDataFrame, stat_html: str, pasta_saida: str, nome_base: str):
-        """Orquestra a criação dos arquivos HTML."""
+    def iniciar_mapa(self, centro_inicial=[0,0]):
+        """Cria a instância base do mapa."""
+        self.mapa = folium.Map(
+            location=centro_inicial,
+            zoom_start=self.config.MAPA_ZOOM_INICIAL,
+            tiles=None,
+            max_zoom=self.config.MAPA_MAX_ZOOM,
+            zoom_control=False # Desativa padrão para evitar conflito visual, opcional
+        )
         
-        # Preparação dos dados em WGS84 (Lat/Lon) para o Leaflet
+    def adicionar_dados_arquivo(self, nome_arquivo_limpo: str, gdf_dados: gpd.GeoDataFrame, metricas: dict, gdf_linhas: gpd.GeoDataFrame):
+        """Adiciona layers de um arquivo específico ao mapa existente."""
+        if not self.mapa:
+            raise Exception("Mapa não inicializado. Chame iniciar_mapa() primeiro.")
+
+        print(f"Adicionando layers para: {nome_arquivo_limpo}")
+
+        # Preparação dos dados em WGS84
         gdf_heatmap = gpd.GeoDataFrame({'valor': metricas['heatmap_valores'], 'geometry': metricas['heatmap_geometria']}, crs=gdf_linhas.crs).to_crs(epsg=4326)
         gdf_cotas = gpd.GeoDataFrame({'valor': metricas['cotas_dados'], 'geometry': metricas['cotas_geometria']}, crs=gdf_linhas.crs).to_crs(epsg=4326)
         gdf_linhas_wgs = gdf_linhas.to_crs(epsg=4326)
         
-        # Amostragem de pontos para não travar o browser
+        # Sub-amostragem de pontos para visualização
         gdf_pontos_total = gdf_dados.to_crs(epsg=4326)
-        if len(gdf_pontos_total) > 5000:
-            gdf_pontos_total = gdf_pontos_total.sample(5000)
-            
-        centro = [gdf_pontos_total.geometry.y.mean(), gdf_pontos_total.geometry.x.mean()]
-        bounds_total = gdf_pontos_total.total_bounds # [minx, miny, maxx, maxy]
-        
-        # Loop de densidades (Passos)
-        passos = self.config.PASSOS_VISUALIZACAO
-        
-        for passo in passos:
-            print(f"Gerando mapa para visualização...")
-            
-            m = folium.Map(location=centro, zoom_start=self.config.MAPA_ZOOM_INICIAL, tiles=None, max_zoom=self.config.MAPA_MAX_ZOOM)
-            
-            # Ajuste de visão
-            margem = 0.05
-            bounds_leaflet = [[bounds_total[1]*(1-margem), bounds_total[0]*(1-margem)], [bounds_total[3]*(1+margem), bounds_total[2]*(1+margem)]]
-            m.fit_bounds(bounds_leaflet)
-            
-            # Base (Satélite)
-            folium.TileLayer(
-                tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
-                attr='Found', name='Satélite', overlay=False
-            ).add_to(m)
-            
-            # --- Camadas ---
-            self._adicionar_camada_heatmap(m, gdf_heatmap)
-            self._adicionar_camada_cotas(m, gdf_cotas, passo)
-            self._adicionar_camada_linhas(m, gdf_linhas_wgs)
-            self._adicionar_camada_pontos(m, gdf_pontos_total)
-            
-            # --- Labels de Clusters ---
-            self._adicionar_labels_cluster(m, gdf_linhas_wgs)
+        if len(gdf_pontos_total) > 2000: # Limite por arquivo para não pesar
+            gdf_pontos_total = gdf_pontos_total.sample(2000)
 
-            # --- Controles de UI ---
-            self._montar_painel_info(m, stat_html)
-            
-            # Ferramenta de Medição
-            MeasureControl(position='topright', primary_length_unit='meters', active_color='#00FF00').add_to(m)
-            Fullscreen().add_to(m)
-            folium.LayerControl(collapsed=False).add_to(m)
+        # Atualiza bounds gerais
+        self.bounds_geral.append(gdf_pontos_total.total_bounds)
 
-            # Salvar
-            nome_arquivo = f"{nome_base}.html"
-            if len(passos) > 1:
-                nome_arquivo = f"{nome_base} - densidade_{passo}.html"
-                
-            caminho_final = os.path.join(pasta_saida, nome_arquivo)
-            m.save(caminho_final)
-            print(f"Mapa salvo em: {caminho_final}")
-            
-            # Compatibilidade legada: se for passo 1 e tiver multiplos, salva o default também
-            if passo == 1 and len(passos) > 1:
-                 m.save(os.path.join(pasta_saida, f"{nome_base}.html"))
-
-    def _adicionar_camada_heatmap(self, m, gdf):
-        if not self.config.LAYER_VISIBILITY['heatmap']: return
-        fg = folium.FeatureGroup(name=self.config.LAYER_NAMES['heatmap'], show=True)
+        # Prefixo para agrupar layers visualmente (ex: [Arquivo1] Heatmap)
+        prefix = f"<b>[{nome_arquivo_limpo}]</b>"
         
-        for _, row in gdf.iterrows():
-            val = row['valor']
-            cor = self.config.ESTILO['cor_cota_alerta'] if (val < self.config.TOLERANCIA_MIN or val > self.config.TOLERANCIA_MAX) else self.config.ESTILO['cor_cota_ok']
-            coords = [(pt[1], pt[0]) for pt in row.geometry.coords]
-            folium.PolyLine(coords, color=cor, weight=self.config.ESTILO['heatmap_espessura'], opacity=self.config.ESTILO['heatmap_opacidade']).add_to(fg)
-        fg.add_to(m)
+        # PASSO para cotas OK (filtra somente 1 a cada X)
+        passo_vis = self.config.PASSOS_VISUALIZACAO[0] if self.config.PASSOS_VISUALIZACAO else 10
 
-    def _adicionar_camada_cotas(self, m, gdf, passo_densidade):
-        # Separa cotas OK e Alertas (alertas sempre aparecem)
-        fg_ok = folium.FeatureGroup(name=self.config.LAYER_NAMES['cotas_ok'], show=False)
-        fg_alerta = folium.FeatureGroup(name=self.config.LAYER_NAMES['cotas_alerta'], show=True)
+        # --- HEATMAP ---
+        if self.config.LAYER_VISIBILITY['heatmap']:
+            fg_heat = folium.FeatureGroup(name=f"{prefix} {self.config.LAYER_NAMES['heatmap']}", show=True)
+            for _, row in gdf_heatmap.iterrows():
+                val = row['valor']
+                cor = self.config.ESTILO['cor_cota_ok']
+                if val < self.config.TOLERANCIA_MIN:
+                    cor = self.config.ESTILO['cor_cota_abaixo']
+                elif val > self.config.TOLERANCIA_MAX:
+                    cor = self.config.ESTILO['cor_cota_acima']
+                coords = [(pt[1], pt[0]) for pt in row.geometry.coords]
+                folium.PolyLine(coords, color=cor, weight=self.config.ESTILO['heatmap_espessura'], opacity=self.config.ESTILO['heatmap_opacidade']).add_to(fg_heat)
+            fg_heat.add_to(self.mapa)
+
+        # --- COTAS (Com Lógica de Zoom) ---
+        # Separamos em Grupos OK (Zoom dependent) e Alertas (Sempre visible)
+        fg_cotas = folium.FeatureGroup(name=f"{prefix} Cotas", show=self.config.LAYER_VISIBILITY['cotas_alerta'])
         
-        for i, row in gdf.iterrows():
+        for i, row in gdf_cotas.iterrows():
             val = row['valor']['val']
             is_alerta = val < self.config.TOLERANCIA_MIN or val > self.config.TOLERANCIA_MAX
             
-            # Lógica de amostragem visual para não poluir
-            if not is_alerta and (i % passo_densidade != 0):
+            # SE PULAR COTAS OK: Se não for alerta, e config diz pra não mostrar, pule.
+            if not is_alerta and not self.config.LAYER_VISIBILITY['cotas_ok']:
                 continue
             
-            grupo_alvo = fg_alerta if is_alerta else fg_ok
-            cor = self.config.ESTILO['cor_cota_alerta'] if is_alerta else self.config.ESTILO['cor_cota_ok']
+            # (Código de amostragem removido pois agora só mostramos alertas)
             
-            # Linha da cota
-            coords = [(pt[1], pt[0]) for pt in row.geometry.coords]
-            folium.PolyLine(coords, color=cor, weight=1, opacity=0.9).add_to(grupo_alvo)
+            cor = self.config.ESTILO['cor_cota_ok']
+            if val < self.config.TOLERANCIA_MIN:
+                cor = self.config.ESTILO['cor_cota_abaixo']
+            elif val > self.config.TOLERANCIA_MAX:
+                cor = self.config.ESTILO['cor_cota_acima']
+            coords = [(pt[1], pt[0]) for pt in row.geometry.coords] # LatLon
             
-            # Marcador com valor
+            
+            # Adiciona Linha da Cota
+            folium.PolyLine(coords, color=cor, weight=1, opacity=0.9).add_to(fg_cotas)
+            
+            # Lógica de Classes CSS para Zoom
+            # cota-alert: sempre visivel (se layer ativa)
+            # cota-lvl-1 (idx%20==0): Zoom Baixo
+            # cota-lvl-2 (idx%5==0): Zoom Médio
+            # cota-lvl-3 (resto): Zoom Alto
+            zoom_class = "cota-alert" if is_alerta else "cota-lvl-3"
+            if not is_alerta:
+                if i % 20 == 0: zoom_class = "cota-lvl-1"
+                elif i % 5 == 0: zoom_class = "cota-lvl-2"
+            
+            # Marcador
             centro_lat = (coords[0][0] + coords[1][0])/2
             centro_lon = (coords[0][1] + coords[1][1])/2
             
-            # Classes CSS para zoom inteligente
-            zoom_class = "cota-alert" if is_alerta else "cota-normal"
-            style_box = f"background: {'rgba(255,255,255,0.7)' if not is_alerta else cor}; color: {'black' if not is_alerta else 'white'}; border: 1px solid {cor}; border-radius: 4px; padding: 2px"
+            style_box = f"background: {'rgba(255,255,255,0.7)' if not is_alerta else cor}; color: {'black' if not is_alerta else 'white'}; border: 1px solid {cor}; border-radius: 4px; padding: 2px; font-weight: bold;"
             
             folium.map.Marker(
                 [centro_lat, centro_lon],
                 icon=folium.DivIcon(
-                    icon_size=(100,20),
-                    icon_anchor=(50,10),
-                    class_name=f"cota-marker {zoom_class}",
-                    html=f'<div style="{style_box}; text-align: center; font-size: 10px; font-weight: bold;">{val:.2f}m</div>'
+                    icon_size=(0,0),
+                    icon_anchor=(0,0),
+                    class_name=f"cota-marker-container {zoom_class}", # Classe CSS aplicada aqui
+                    html=f'<div style="{style_box}; font-size: 10px; white-space: nowrap; pointer-events: none; transform: translate(-50%, -50%); display: inline-block;">{val:.2f}m</div>'
                 )
-            ).add_to(grupo_alvo)
+            ).add_to(fg_cotas)
             
-        fg_alerta.add_to(m)
-        fg_ok.add_to(m)
+        fg_cotas.add_to(self.mapa)
 
-    def _adicionar_camada_linhas(self, m, gdf):
-        if not self.config.LAYER_VISIBILITY['linhas']: return
-        fg = folium.FeatureGroup(name=self.config.LAYER_NAMES['linhas'], show=False)
-        folium.GeoJson(
-            gdf, 
-            style_function=lambda x: {
-                'color': self.config.ESTILO['cor_linha'], 
-                'weight': self.config.ESTILO['linha_espessura'], 
-                'opacity': self.config.ESTILO['linha_opacidade']
-            }
-        ).add_to(fg)
-        fg.add_to(m)
+        # --- LINHAS TRAJETÓRIA ---
+        if self.config.LAYER_VISIBILITY['linhas']:
+            fg_linhas = folium.FeatureGroup(name=f"{prefix} {self.config.LAYER_NAMES['linhas']}", show=False)
+            col_geo = gdf_linhas_wgs.geometry
+            # Simplifica renderização: MultiLineString única se possível ou iterar
+            # Iterando para manter estilo consistente
+            for geom in col_geo:
+                if geom.geom_type == 'LineString':
+                    coords = [(pt[1], pt[0]) for pt in geom.coords]
+                    folium.PolyLine(coords, color=self.config.ESTILO['cor_linha'], weight=self.config.ESTILO['linha_espessura'], opacity=self.config.ESTILO['linha_opacidade']).add_to(fg_linhas)
+            fg_linhas.add_to(self.mapa)
 
-    def _adicionar_camada_pontos(self, m, gdf):
-        # Apenas se explicitamente solicitado
-        if not self.config.LAYER_VISIBILITY['pontos']: return
+        # --- CLUSTERS LABELS ---
+        if 'cluster_label' in gdf_linhas_wgs.columns:
+            clusters = gdf_linhas_wgs.dissolve(by='cluster_label')
+            for label, row in clusters.iterrows():
+                centro = row.geometry.centroid
+                folium.Marker(
+                    [centro.y, centro.x],
+                    icon=folium.DivIcon(
+                        class_name="cluster-marker-container",
+                        html=f"<div style='font-size: 24px; color: white; font-weight: bold; white-space: nowrap; pointer-events: none; text-shadow: 0 0 3px #000, 0 0 6px #000, 0 0 10px #000;'>{label}</div>"
+                    )
+                ).add_to(self.mapa)
+
+    def salvar_mapa(self, pasta_saida: str, nome_base: str, html_painel_global: str):
+        """Finaliza o mapa, injeta CSS/JS e salva."""
+        if not self.mapa: return
+
+        # Cálculo de Bounds Global
+        bounds_projeto = None
+        if self.bounds_geral:
+            min_x = min(b[0] for b in self.bounds_geral)
+            min_y = min(b[1] for b in self.bounds_geral)
+            max_x = max(b[2] for b in self.bounds_geral)
+            max_y = max(b[3] for b in self.bounds_geral)
+            
+            # Margem de 10%
+            margem_x = (max_x - min_x) * 0.1
+            margem_y = (max_y - min_y) * 0.1
+            
+            bounds_projeto = [[min_y - margem_y, min_x - margem_x], [max_y + margem_y, max_x + margem_x]]
+            self.mapa.fit_bounds(bounds_projeto)
         
-        fg = folium.FeatureGroup(name=self.config.LAYER_NAMES['pontos'], show=False)
-        for _, row in gdf.iterrows():
-             folium.CircleMarker(
-                 [row.geometry.y, row.geometry.x],
-                 radius=1, color='orange', fill=True
-             ).add_to(fg)
-        fg.add_to(m)
+        # Adiciona TileLayer AGORA com bounds (Recorte de background)
+        # max_native_zoom=20 permite zoom digital além do nível 20
+        # control=False esconde do Layer Control
+        folium.TileLayer(
+            tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+            attr='Found', name='Satélite', overlay=False, control=False,
+            max_native_zoom=20,
+            max_zoom=self.config.MAPA_MAX_ZOOM
+        ).add_to(self.mapa)
 
-    def _adicionar_labels_cluster(self, m, gdf):
-        if 'cluster_label' not in gdf.columns: return
-        # Calcula centróide de cada cluster
-        clusters = gdf.dissolve(by='cluster_label')
-        for label, row in clusters.iterrows():
-            centro = row.geometry.centroid
-            folium.Marker(
-                [centro.y, centro.x],
-                icon=folium.DivIcon(html=f"<div style='font-size: 24px; color: white; font-weight: bold; text-shadow: 2px 2px 4px black;'>{label}</div>")
-            ).add_to(m)
-
-    def _montar_painel_info(self, m, html_stats):
-        # CSS Injetado para Painel e Controle de Zoom
+        # 1. CSS (Zoom Classes + Painel Minimzável + Ícone Régua)
         css = """
         <style>
             .info-panel {
-                position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%);
-                z-index: 9999; background: rgba(255,255,255,0.95); padding: 10px;
-                border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-                min-width: 250px; font-family: sans-serif;
+                position: fixed; bottom: 2px; left: 50%; transform: translateX(-50%);
+                z-index: 9999; background: rgba(255,255,255,0.95); padding: 0;
+                border: 1px solid #ccc; /* Borda leve */
+                border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+                min-width: 400px; 
+                max-width: 95vw; max-height: 80vh; /* Aumentado para caber layers */
+                transition: height 0.3s ease;
+                display: flex; flex-direction: column; overflow: hidden;
+                font-size: 12px;
             }
+            .info-panel.minimized .panel-content {
+                display: none !important;
+            }
+            /* Layers sempre visíveis, mesmo minimizado */
+            .layers-container {
+                border-bottom: 1px solid #ddd;
+                background: #f9f9f9;
+                padding: 3px;
+                max-height: 30vh;
+                overflow-y: auto;
+            }
+            .panel-header {
+                display: flex; justify-content: center; align-items: center; position: relative;
+                cursor: pointer; background: #f0f0f0; padding: 6px 10px; border-bottom: 1px solid #ccc;
+                flex-shrink: 0;
+            }
+            .panel-title { font-weight: bold; font-size: 12px; text-align: center; }
+            .panel-content {
+                overflow-y: auto; padding: 6px; flex-grow: 1;
+            }
+            .stats-grid {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                margin-bottom: 6px;
+            }
+            .stats-block {
+                border-bottom: 1px solid #eee;
+                padding-bottom: 10px;
+            }
+            .stats-block:last-child {
+                border-bottom: none;
+            }
+            .stats-grid > div {
+                min-width: 0;
+            }
+            .toggle-btn {
+                background: #ddd; border: none; padding: 2px 8px; border-radius: 4px; font-weight: bold; position: absolute; right: 8px;
+            }
+            .leaflet-control-measure-toggle {
+                background-image: none !important; display: flex; align-items: center; justify-content: center;
+                font-size: 20px; color: #000;
+            }
+            .leaflet-control-measure-toggle::after { content: '📏'; }
             .leaflet-control-attribution { display: none !important; }
-            /* Zoom Logic */
-            .hide-cotas .cota-normal { display: none; }
+            
+            /* Lógica de Zoom para Cotas */
+            .cota-lvl-2, .cota-lvl-3 { display: none; }
+            .show-details .cota-lvl-2, .show-details .cota-lvl-3 { display: block !important; }
+            .hide-all-cotas .cota-marker-container { display: none !important; }
+            .cota-alert { display: block !important; }
+            
+            /* CLUSTERS: Visível apenas Zoom <= 17 */
+            .hide-clusters .cluster-marker-container { display: none !important; }
+
+            /* Layer Control Customization */
+            .leaflet-control-layers {
+                box-shadow: none !important; border: none !important; background: none !important;
+                margin: 0 !important; padding: 0 !important; width: 100% !important;
+            }
+            .leaflet-control-layers-list { margin-bottom: 0; }
+            .leaflet-control-layers-overlays {
+                 display: flex; flex-direction: column !important; align-items: flex-start !important; width: 100%;
+            }
+            .leaflet-control-layers-overlays label {
+                 box-sizing: border-box; margin-bottom: 4px; font-size: 12px; width: 100%;
+                 display: inline-flex; align-items: center; background: transparent; padding: 2px; border-radius: 4px; border: none;
+            }
+            .cluster-marker-container {
+                white-space: nowrap !important;
+                pointer-events: none !important;
+                text-shadow: 0 0 3px #000, 0 0 6px #000, 0 0 10px #000 !important;
+            }
         </style>
         """
+
+        # 2. JS (Zoom + Toggle Panel + Zoom Display)
+        map_id = self.mapa.get_name()
+        
+        # Ajuste: Define variáveis para injeção no JS
+        min_zoom = self.config.ZOOM_MIN_COTAS
+        max_cluster_zoom = self.config.ZOOM_MAX_CLUSTERS
+        
         js = f"""
         <script>
+            function togglePanel() {{
+                var panel = document.querySelector('.info-panel');
+                panel.classList.toggle('minimized');
+                var btn = document.querySelector('.toggle-btn');
+                btn.innerText = panel.classList.contains('minimized') ? '+' : '-';
+            }}
+
             document.addEventListener("DOMContentLoaded", function() {{
-                var map = {m.get_name()};
-                map.on('zoomend', function() {{
-                    var z = map.getZoom();
-                    var container = map.getContainer();
-                    if (z < 19) container.classList.add('hide-cotas');
-                    else container.classList.remove('hide-cotas');
-                }});
-                // Trigger inicial
-                map.fire('zoomend');
+                var map = {map_id};
+                var minDetailZoom = {min_zoom};
+                var maxClusterZoom = {max_cluster_zoom};
                 
-                // Hack para mover layer control (opcional, mantendo simples por agora)
+                map.dragging.enable();
+                map.scrollWheelZoom.enable();
+                map.touchZoom.enable();
+                
+                // --- MOSTRADOR DE ZOOM ---
+                var zoomDisplay = document.createElement('div');
+                zoomDisplay.id = 'zoom-display';
+                zoomDisplay.innerHTML = 'Zoom Atual: <span id="z-val">--</span>';
+                zoomDisplay.style.cssText = 'position:fixed; top:10px; left:50%; transform:translateX(-50%); background:rgba(0,0,0,0.8); color:white; padding:5px 15px; border-radius:20px; font-size:14px; font-weight:bold; z-index:10000; pointer-events:none; box-shadow: 0 2px 5px rgba(0,0,0,0.5);';
+                document.body.appendChild(zoomDisplay);
+
+                function updateZoomText() {{
+                    var z = map.getZoom();
+                    var el = document.getElementById('z-val');
+                    if(el) el.innerText = z;
+                }}
+
+                // --- LOGICA DE CAMADAS ---
+                setTimeout(function() {{
+                    var layerControl = document.querySelector('.leaflet-control-layers');
+                    var layersContainer = document.querySelector('.layers-container');
+                    if (layerControl && layersContainer) {{
+                        layersContainer.appendChild(layerControl);
+                        layerControl.classList.add('leaflet-control-layers-expanded');
+                        var base = layerControl.querySelector('.leaflet-control-layers-base');
+                        if (base) {{ base.style.display = 'none'; }}
+                        var overlays = layerControl.querySelector('.leaflet-control-layers-overlays');
+                        if (overlays) {{ overlays.style.display = 'flex'; overlays.style.flexDirection = 'column'; }}
+                    }}
+                }}, 800);
+
+                function updateVisibility() {{
+                    var z = map.getZoom();
+                    updateZoomText();
+                    
+                    var container = map.getContainer();
+                    
+                    // Lógica Cotas
+                    if (z >= minDetailZoom) {{
+                        container.classList.add('show-details');
+                        container.classList.remove('hide-all-cotas');
+                    }} else {{
+                        container.classList.add('hide-all-cotas');
+                        container.classList.remove('show-details');
+                    }}
+                    
+                    // Lógica Clusters
+                    // Se cotas aparecem, clusters somem. Sincronizado.
+                    if (z >= minDetailZoom) {{
+                        container.classList.add('hide-clusters');
+                    }} else {{
+                        container.classList.remove('hide-clusters');
+                    }}
+                }}
+                
+                map.on('zoomend', updateVisibility);
+                map.on('moveend', updateVisibility); // Reforço
+                updateVisibility();
             }});
         </script>
         """
-        html_final = f'{css}{js}<div class="info-panel">{html_stats}</div>'
-        m.get_root().html.add_child(folium.Element(html_final))
+        
+        # Painel HTML Estruturado
+        painel_div = f'''
+        <div class="info-panel">
+            <div class="panel-header" onclick="togglePanel()">
+                <div class="panel-title">Informações</div>
+                <button class="toggle-btn">-</button>
+            </div>
+            
+            <!-- Area de Layers Fixa (Não some no minimize) -->
+            <div class="layers-container">
+                <!-- Layers injetados aqui via JS -->
+            </div>
+
+            <!-- Conteudo Minimizavel -->
+            <div class="panel-content">
+                <div class="stats-grid">
+                    {html_painel_global}
+                </div>
+            </div>
+        </div>
+        '''
+        
+        self.mapa.get_root().html.add_child(folium.Element(css))
+        self.mapa.get_root().html.add_child(folium.Element(js))
+        self.mapa.get_root().html.add_child(folium.Element(painel_div))
+
+        MeasureControl(position='topright', primary_length_unit='meters', active_color='#00FF00').add_to(self.mapa)
+        Fullscreen().add_to(self.mapa)
+        folium.LayerControl(collapsed=False).add_to(self.mapa)
+
+        caminho_final = os.path.join(pasta_saida, f"{nome_base}.html")
+        self.mapa.save(caminho_final)
+        print(f"Mapa salvo em: {caminho_final}")
 
 # ==============================================================================
 # PIPELINE PRINCIPAL
 # ==============================================================================
 
 def main():
+    # Garante saída em UTF-8 no terminal Windows para evitar "mojibake"
+    # Usa reconfigure (Python 3.7+) para não quebrar o buffer/flush
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+            sys.stderr.reconfigure(encoding='utf-8')
+        except AttributeError:
+            # Fallback para versões muito antigas (embora o user use 3.13)
+            pass
+
     inicio_proc = datetime.now()
     dir_atual = os.path.dirname(os.path.abspath(__file__))
     
-    # 1. Obtenção de Dados
-    zip_path = GerenciadorArquivos.buscar_zip_mais_recente(dir_atual)
-    if zip_path:
-        print(f"Arquivo ZIP encontrado: {zip_path}")
-        pasta_dados = GerenciadorArquivos.extrair_zip(zip_path, os.path.join(dir_atual, "dados_extraidos"))
-    else:
-        print("Nenhum ZIP encontrado. Buscando na pasta 'doc'.")
-        pasta_dados = os.path.join(dir_atual, "doc")
-        
-    shp_path = GerenciadorArquivos.encontrar_shapefile(pasta_dados)
-    if not shp_path:
-        print("Erro: Nenhum arquivo .shp encontrado.")
+    # 1. Configuração e Inicialização
+    arquivos_zips = GerenciadorArquivos.buscar_todos_zips(dir_atual)
+    if not arquivos_zips:
+        print("Nenhum arquivo ZIP encontrado neste diretório.")
         return
 
-    print(f"Carregando arquivo: {shp_path}")
-    try:
-        size_mb = os.path.getsize(shp_path) / (1024*1024)
-        print(f"Tamanho do arquivo: {size_mb:.2f} MB")
-        gdf_bruto = gpd.read_file(shp_path)
-    except Exception as e:
-        print(f"Erro ao ler arquivo: {e}")
-        return
-
-    if gdf_bruto.empty: return
-
-    # 2. Pré-processamento e Projeção
-    if not gdf_bruto.crs.is_projected:
-         centro = gdf_bruto.geometry.iloc[0] # Simplificação
-         epsg = UtilitariosGeo.calcular_epsg_utm(centro.y, centro.x)
-         print(f"Convertendo para UTM (EPSG:{epsg})...")
-         gdf_utm = gdf_bruto.to_crs(epsg=epsg)
-    else:
-         gdf_utm = gdf_bruto
-
-    # 3. Processamento Core (Trajetória)
-    print("Gerando linhas a partir dos pontos (por tempo e direção)...")
-    linhas_geom, metadados_linhas = ProcessadorTrajetoria.gerar_linhas_de_voo(gdf_utm, TABELA_CONFIG)
-    
-    if not linhas_geom:
-        print("Não foi possível gerar linhas de trajetória.")
-        return
-        
-    gdf_linhas = gpd.GeoDataFrame(metadados_linhas, geometry=linhas_geom, crs=gdf_utm.crs)
-    print(f"Segmentos gerados: {len(gdf_linhas)}")
-
-    print("Agrupando linhas em Clusters (Áreas de Interesse)...")
-    gdf_linhas = ProcessadorTrajetoria.agrupar_por_clusters(gdf_linhas, TABELA_CONFIG)
-    print(f"Clusters identificados: {gdf_linhas['cluster_id'].nunique() if 'cluster_id' in gdf_linhas else 0}")
-
-    print("Unindo segmentos fragmentados...")
-    gdf_linhas = ProcessadorTrajetoria.conectar_segmentos_quebrados(gdf_linhas, TABELA_CONFIG)
-
-    # 4. Análise de Espaçamento
-    print("Calculando distâncias laterais...")
-    analisador = AnalisadorEspacamento(TABELA_CONFIG)
-    metricas = analisador.processar(gdf_linhas)
-
-    # 5. Relatórios e Exportação
-    media, tiro_medio = GeradorRelatorio.exibir_terminal(metricas, gdf_linhas, TABELA_CONFIG)
-    html_painel = GeradorRelatorio.gerar_html_tabela(media, tiro_medio, gdf_linhas, TABELA_CONFIG)
+    print(f"Arquivos encontrados: {len(arquivos_zips)}")
     
     viz = VisualizadorMapa(TABELA_CONFIG)
+    viz.iniciar_mapa()
+    
+    html_painel_agregado = ""
+    stats_globais = {'tiro_medio_soma': 0, 'tiro_medio_conta': 0, 'espacamento_soma': 0, 'espacamento_conta': 0}
+    
+    pasta_extraida_base = os.path.join(dir_atual, "dados_extraidos")
+
+    # 2. Processamento Loop
+    for zip_path in arquivos_zips:
+        nome_arquivo_full = os.path.basename(zip_path)
+        nome_arquivo_limpo = os.path.splitext(nome_arquivo_full)[0] # Remove .zip
+        print(f"\n>>> Processando: {nome_arquivo_limpo}")
+        
+        try:
+            # Extração Única
+            pasta_dados = GerenciadorArquivos.extrair_zip(zip_path, pasta_extraida_base)
+            shp_path = GerenciadorArquivos.encontrar_shapefile(pasta_dados)
+            
+            if not shp_path:
+                print("  [X] Shapefile não encontrado no ZIP.")
+                continue
+                
+            # Carga
+            gdf_bruto = gpd.read_file(shp_path)
+            if gdf_bruto.empty: continue
+            
+            # Projeção
+            if not gdf_bruto.crs.is_projected:
+                centro = gdf_bruto.geometry.iloc[0]
+                epsg = UtilitariosGeo.calcular_epsg_utm(centro.y, centro.x)
+                gdf_utm = gdf_bruto.to_crs(epsg=epsg)
+            else:
+                gdf_utm = gdf_bruto
+                
+            # Processamento
+            linhas_geom, metadados_linhas = ProcessadorTrajetoria.gerar_linhas_de_voo(gdf_utm, TABELA_CONFIG)
+            if not linhas_geom: 
+                print("  [!] Falha ao gerar linhas.")
+                continue
+                
+            gdf_linhas = gpd.GeoDataFrame(metadados_linhas, geometry=linhas_geom, crs=gdf_utm.crs)
+            
+            # Clustering e União
+            gdf_linhas = ProcessadorTrajetoria.agrupar_por_clusters(gdf_linhas, TABELA_CONFIG)
+            
+            # ATUALIZAÇÃO: Prefixo no Cluster (ex: "Arquivo A")
+            if 'cluster_label' in gdf_linhas.columns:
+                gdf_linhas['cluster_label'] = gdf_linhas['cluster_label'].apply(lambda l: f"{nome_arquivo_limpo} {l}")
+
+            gdf_linhas = ProcessadorTrajetoria.conectar_segmentos_quebrados(gdf_linhas, TABELA_CONFIG)
+            
+            # Análise
+            analisador = AnalisadorEspacamento(TABELA_CONFIG)
+            metricas = analisador.processar(gdf_linhas)
+            
+            # Relatórios
+            print("  --- stats ---")
+            media, tiro_medio = GeradorRelatorio.exibir_terminal(metricas, gdf_linhas, TABELA_CONFIG)
+            
+            # Acumula Stats Globais
+            if media > 0:
+                stats_globais['espacamento_soma'] += media
+                stats_globais['espacamento_conta'] += 1
+            if tiro_medio > 0:
+                stats_globais['tiro_medio_soma'] += tiro_medio
+                stats_globais['tiro_medio_conta'] += 1
+
+            # HTML Parcial (Com título do arquivo) - Wrapped em div para grid
+            html_painel = GeradorRelatorio.gerar_html_tabela(media, tiro_medio, gdf_linhas, TABELA_CONFIG)
+            html_painel_agregado += f"<div><h4 style='margin:0 0 5px 0;'>{nome_arquivo_limpo}</h4>{html_painel}</div>"
+            
+            # Adiciona ao Mapa
+            viz.adicionar_dados_arquivo(nome_arquivo_limpo, gdf_utm, metricas, gdf_linhas)
+            
+        except Exception as e:
+            print(f"  [ERRO CRÍTICO] Falha ao processar {nome_arquivo_limpo}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # 3. Finalização
+    print("\n==========================================")
+    print("Processamento concluído.")
     
     ontem_str = (datetime.now() - timedelta(days=1)).strftime('%d-%m-%Y')
-    nome_base = f"Mapa Espaçamento Plantio - {ontem_str}"
+    nome_final = f"Mapa Consolidado - {ontem_str}"
     pasta_mapas = os.path.join(dir_atual, "mapas")
     os.makedirs(pasta_mapas, exist_ok=True)
     
-    viz.gerar_mapas(gdf_utm, metricas, gdf_linhas, html_painel, pasta_mapas, nome_base)
+    # Salva Mapa
+    viz.salvar_mapa(pasta_mapas, nome_final, html_painel_agregado)
 
     tempo_total = datetime.now() - inicio_proc
-    print(f"\nTempo total de processamento: {str(tempo_total).split('.')[0]}")
+    print(f"Tempo total: {str(tempo_total).split('.')[0]}")
 
 if __name__ == "__main__":
     main()
