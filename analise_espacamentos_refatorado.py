@@ -947,98 +947,80 @@ class VisualizadorMapa:
                 }}
 
                 // --- LOGICA DE CAMADAS ---
+                
+                // Mapa de referências para as layers (Nome -> Objeto Layer)
+                var layerRef = {{}};
+
                 setTimeout(function() {{
+                    var layerControlInstance = null;
+                    for (var key in window) {{
+                        try {{
+                            if (window[key] instanceof L.Control.Layers) {{
+                                layerControlInstance = window[key];
+                                break;
+                            }}
+                        }} catch(e) {{}}
+                    }}
+
+                    if (layerControlInstance && layerControlInstance._layers) {{
+                        layerControlInstance._layers.forEach(function(obj) {{
+                            if (obj.name) {{
+                                layerRef[obj.name.trim()] = obj.layer;
+                            }}
+                        }});
+                    }}
+
+                    map.eachLayer(function(layer) {{
+                        if (layer.options && layer.options.name) {{
+                            layerRef[layer.options.name.trim()] = layer;
+                        }}
+                    }});
+
                     var layerControl = document.querySelector('.leaflet-control-layers');
                     var layersContainer = document.querySelector('.layers-container');
                     
                     if (layerControl && layersContainer) {{
+                        layersContainer.innerHTML = '';
                         layersContainer.appendChild(layerControl);
-                        layerControl.classList.add('leaflet-control-layers-expanded');
-                        
-                        var base = layerControl.querySelector('.leaflet-control-layers-base');
-                        if (base) {{ base.style.display = 'none'; }}
-                        
-                        var overlays = layerControl.querySelector('.leaflet-control-layers-overlays');
-                        if (overlays) {{ 
-                            overlays.style.display = 'flex'; 
-                            overlays.style.flexDirection = 'column';
-                            overlays.style.width = '100%';
-                            
-                            // --- REORGANIZAÇÃO EM ROWS POR ARQUIVO ---
-                            // Pega labels originais
-                            var labels = Array.from(overlays.querySelectorAll('label'));
-                            var groups = {{}};
-                            var others = [];
-                            
-                            labels.forEach(function(lbl) {{
-                                var span = lbl.querySelector('span');
-                                var text = span ? span.innerText : lbl.innerText;
-                                
-                                // Regex para capturar [NomeArquivo]
-                                var match = text.match(/\\[(.*?)\\]/);
-                                if (match) {{
-                                    var filename = match[1];
-                                    if (!groups[filename]) groups[filename] = [];
-                                    groups[filename].push(lbl);
-                                }} else {{
-                                    others.push(lbl);
+                        layerControl.style.display = '';
+
+                        var overlayLabels = layerControl.querySelectorAll('.leaflet-control-layers-overlays label');
+                        var trendByGroup = {{}};
+                        var cotasByGroup = {{}};
+
+                        overlayLabels.forEach(function(label) {{
+                            var span = label.querySelector('span');
+                            var input = label.querySelector('input');
+                            if (!span || !input) return;
+                            var text = span.textContent || '';
+                            var match = text.match(/\\[(.*?)\\]/);
+                            if (!match) return;
+                            var group = match[1];
+                            if (text.indexOf('Mapa de Tendência') !== -1) {{
+                                trendByGroup[group] = input;
+                            }}
+                            if (text.indexOf('Cotas') !== -1) {{
+                                cotasByGroup[group] = input;
+                            }}
+                        }});
+
+                        function linkTrendToCotas(trendInput, cotasInput) {{
+                            if (!trendInput || !cotasInput) return;
+                            trendInput.addEventListener('change', function() {{
+                                if (!this.checked && cotasInput.checked) {{
+                                    cotasInput.checked = false;
+                                    cotasInput.dispatchEvent(new Event('change'));
                                 }}
                             }});
-                            
-                            // Limpa container
-                            overlays.innerHTML = '';
-                            
-                            // Cria Rows por Arquivo
-                            for (var file in groups) {{
-                                var row = document.createElement('div');
-                                row.className = 'layer-row';
-                                row.style.cssText = 'display: flex; align-items: center; flex-wrap: wrap; gap: 8px; border-bottom: 1px solid #eee; padding: 4px 0; width: 100%;';
-                                
-                                // Nome do Arquivo (destaque)
-                                var title = document.createElement('div');
-                                title.style.cssText = 'font-weight: bold; font-size: 11px; color: #333; margin-right: 5px; min-width: 80px;';
-                                title.innerText = file;
-                                row.appendChild(title);
-                                
-                                // Layers do Arquivo
-                                groups[file].forEach(function(lbl) {{
-                                    // Limpa o texto [Nome] do label para economizar espaço
-                                    var span = lbl.querySelector('span');
-                                    if (span) {{
-                                        span.innerHTML = span.innerHTML.replace(/\\[.*?\\]\\s*/, '').trim();
-                                    }}
-                                    // Ajuste estilo do label
-                                    lbl.style.margin = '0';
-                                    lbl.style.width = 'auto';
-                                    lbl.style.display = 'inline-flex';
-                                    row.appendChild(lbl);
-                                }});
-                                
-                                overlays.appendChild(row);
-                            }}
-                            
-                            // Outros Layers (ex: Clusters, etc)
-                            if (others.length > 0) {{
-                                var row = document.createElement('div');
-                                row.style.cssText = 'display: flex; flex-direction: column; gap: 2px; padding: 4px 0;';
-                                others.forEach(function(lbl) {{ overlays.appendChild(lbl); }});
-                                overlays.appendChild(row);
-                            }}
+                        }}
+
+                        for (var g in trendByGroup) {{
+                            linkTrendToCotas(trendByGroup[g], cotasByGroup[g]);
                         }}
                     }}
 
-                    var inputs = layerControl ? layerControl.querySelectorAll('input[type="checkbox"]') : [];
-                    inputs.forEach(function(inp) {{
-                        inp.addEventListener('change', function() {{
-                            var layer = map._layers[inp.layerId];
-                            if (!layer) return;
-                            if (inp.checked) {{
-                                map.addLayer(layer);
-                            }} else {{
-                                map.removeLayer(layer);
-                            }}
-                        }});
-                    }});
+                    // Removemos a lógica antiga de "Reforço de Eventos" pois agora controlamos diretamente
+                    console.log("Painel customizado carregado. Total layers:", Object.keys(layerRef).length);
                 }}, 800);
 
                 function updateVisibility() {{
