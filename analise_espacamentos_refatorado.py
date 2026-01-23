@@ -876,11 +876,16 @@ class VisualizadorMapa:
             }
             .leaflet-control-layers-list { margin-bottom: 0; }
             .leaflet-control-layers-overlays {
-                 display: flex; flex-direction: column !important; align-items: flex-start !important; width: 100%;
+                 display: block; width: 100%;
             }
+            .leaflet-control-layers-overlays .layer-row {
+                 display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px;
+                 width: 100%; padding: 2px 0; border-bottom: 1px solid #eee;
+            }
+            .leaflet-control-layers-overlays .layer-row:last-child { border-bottom: none; }
             .leaflet-control-layers-overlays label {
-                 box-sizing: border-box; margin-bottom: 4px; font-size: 12px; width: 100%;
-                 display: inline-flex; align-items: center; background: transparent; padding: 2px; border-radius: 4px; border: none;
+                 box-sizing: border-box; margin: 0; font-size: 12px; width: auto;
+                 display: inline-flex; align-items: center; background: transparent; padding: 2px 0; border-radius: 4px; border: none;
             }
             .cluster-marker-container {
                 white-space: nowrap !important;
@@ -984,9 +989,36 @@ class VisualizadorMapa:
                         layersContainer.appendChild(layerControl);
                         layerControl.style.display = '';
 
+                        var overlaysContainer = layerControl.querySelector('.leaflet-control-layers-overlays');
                         var overlayLabels = layerControl.querySelectorAll('.leaflet-control-layers-overlays label');
                         var trendByGroup = {{}};
                         var cotasByGroup = {{}};
+
+                        if (overlaysContainer) {{
+                            var groups = {{}};
+                            overlayLabels.forEach(function(label) {{
+                                var span = label.querySelector('span');
+                                if (!span) return;
+                                var text = span.textContent || '';
+                                var match = text.match(/\\[(.*?)\\]/);
+                                var group = match ? match[1] : 'Outros';
+                                if (!groups[group]) groups[group] = [];
+                                groups[group].push(label);
+                            }});
+
+                            overlaysContainer.innerHTML = '';
+
+                            Object.keys(groups).forEach(function(groupName) {{
+                                var row = document.createElement('div');
+                                row.className = 'layer-row';
+
+                                groups[groupName].forEach(function(label) {{
+                                    row.appendChild(label);
+                                }});
+
+                                overlaysContainer.appendChild(row);
+                            }});
+                        }}
 
                         overlayLabels.forEach(function(label) {{
                             var span = label.querySelector('span');
